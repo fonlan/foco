@@ -1331,6 +1331,14 @@ type SourceControlTarget = {
   label: string;
 };
 
+type SourceControlView = {
+  chatKey: string | null;
+  isVisible: boolean;
+  selectedDiffPath: string | null;
+  target: SourceControlTarget | null;
+  workspaceId: string;
+};
+
 function sourceControlTargetKey(target: SourceControlTarget | null) {
   return target?.kind === "worktree" && target.path
     ? `worktree:${target.path}`
@@ -2282,6 +2290,17 @@ export function App() {
   const workspaceSpecJobObserversRef = useRef<
     Map<string, WorkspaceSpecJobObserver>
   >(new Map());
+  const gitDiffRequestRef = useRef<AbortController | null>(null);
+  const gitDiffRequestIdRef = useRef(0);
+  const gitOperationRequestIdRef = useRef(0);
+  const sourceControlTargetIdentityRef = useRef<string | null>(null);
+  const sourceControlViewRef = useRef<SourceControlView>({
+    chatKey: null,
+    isVisible: false,
+    selectedDiffPath: null,
+    target: null,
+    workspaceId: "",
+  });
   const gitBranchesRequestRef = useRef<AbortController | null>(null);
   const gitBranchesRequestIdRef = useRef(0);
   const workspacesRefreshGenerationRef = useRef(0);
@@ -2551,6 +2570,13 @@ export function App() {
       : defaultSourceControlTarget;
   const sourceControlTargetKeyValue =
     sourceControlTargetKey(sourceControlTarget);
+  sourceControlViewRef.current = {
+    chatKey: activeChatKey,
+    isVisible: isContextPanelOpen && contextPanelTab === "git",
+    selectedDiffPath,
+    target: sourceControlTarget,
+    workspaceId: activeWorkspace?.id ?? "",
+  };
   const isLoadingContextUsage = activeContextUsageKey
     ? (contextUsageLoadingByChatKey[activeContextUsageKey] ?? false)
     : false;
@@ -4231,12 +4257,28 @@ export function App() {
     [],
   );
 
+  const invalidateGitDiffRequest = useCallback(() => {
+    gitDiffRequestRef.current?.abort();
+    gitDiffRequestRef.current = null;
+    gitDiffRequestIdRef.current += 1;
+    setIsLoadingDiff(false);
+  }, []);
+
   const loadGitDiff = useCallback(
     async (
       workspaceId: string,
       path: string | null,
       target?: SourceControlTarget | null,
     ) => {
+      if (activeWorkspaceIdRef.current !== workspaceId) {
+        return null;
+      }
+
+      const requestedTargetKey = sourceControlTargetKey(target ?? null);
+      invalidateGitDiffRequest();
+      const requestId = gitDiffRequestIdRef.current;
+      const abortController = new AbortController();
+      gitDiffRequestRef.current = abortController;
       setIsLoadingDiff(true);
       setDiffError(null);
 
@@ -4250,21 +4292,50 @@ export function App() {
         const query = queryString ? `?${queryString}` : "";
         const data = await requestJson<GitDiffResponse>(
           `/api/workspaces/${encodeURIComponent(workspaceId)}/git/diff${query}`,
+          { signal: abortController.signal },
         );
+        if (
+          abortController.signal.aborted ||
+          gitDiffRequestIdRef.current !== requestId ||
+          activeWorkspaceIdRef.current !== workspaceId ||
+          sourceControlViewRef.current.workspaceId !== workspaceId ||
+          sourceControlTargetKey(sourceControlViewRef.current.target) !==
+            requestedTargetKey
+        ) {
+          return null;
+        }
         setGitDiff(data);
         setSelectedDiffPath(
           path && data.files.some((file) => file.path === path) ? path : null,
         );
         return data;
       } catch (requestError) {
+        if (
+          abortController.signal.aborted ||
+          gitDiffRequestIdRef.current !== requestId ||
+          activeWorkspaceIdRef.current !== workspaceId ||
+          sourceControlViewRef.current.workspaceId !== workspaceId ||
+          sourceControlTargetKey(sourceControlViewRef.current.target) !==
+            requestedTargetKey
+        ) {
+          return null;
+        }
         setGitDiff(null);
         setDiffError(errorMessage(requestError));
         return null;
       } finally {
-        setIsLoadingDiff(false);
+        if (gitDiffRequestRef.current === abortController) {
+          gitDiffRequestRef.current = null;
+        }
+        if (
+          gitDiffRequestIdRef.current === requestId &&
+          activeWorkspaceIdRef.current === workspaceId
+        ) {
+          setIsLoadingDiff(false);
+        }
       }
     },
-    [],
+    [invalidateGitDiffRequest],
   );
 
   const loadContextMemories = useCallback(
@@ -5112,6 +5183,49 @@ export function App() {
     setSelectedSourceControlTarget(null);
     setIsSourceControlTargetManual(false);
   }, [activeWorkspace?.id, activeChatId]);
+
+  useEffect(() => {
+    invalidateGitDiffRequest();
+    gitOperationRequestIdRef.current += 1;
+    setGitDiff(null);
+    setSelectedDiffPath(null);
+    setDiffError(null);
+    setIsLoadingDiff(false);
+    setGitOperationKey(null);
+    setGitCommitMessage("");
+
+    return () => {
+      invalidateGitDiffRequest();
+    };
+  }, [activeWorkspace?.id, invalidateGitDiffRequest]);
+
+  useEffect(() => {
+    const targetIdentity = [
+      activeWorkspace?.id ?? "",
+      sourceControlTargetKeyValue,
+    ].join("\u0000");
+    const previousTargetIdentity = sourceControlTargetIdentityRef.current;
+    sourceControlTargetIdentityRef.current = targetIdentity;
+    if (
+      previousTargetIdentity === null ||
+      previousTargetIdentity === targetIdentity
+    ) {
+      return;
+    }
+
+    invalidateGitDiffRequest();
+    gitOperationRequestIdRef.current += 1;
+    setGitDiff(null);
+    setSelectedDiffPath(null);
+    setDiffError(null);
+    setIsLoadingDiff(false);
+    setGitOperationKey(null);
+    setGitCommitMessage("");
+  }, [
+    activeWorkspace?.id,
+    invalidateGitDiffRequest,
+    sourceControlTargetKeyValue,
+  ]);
 
   useEffect(() => {
     if (
@@ -9866,21 +9980,36 @@ export function App() {
       return;
     }
 
+    const workspaceId = activeWorkspace.id;
+    const target = sourceControlTarget;
+    const targetKey = sourceControlTargetKey(target);
+    invalidateGitDiffRequest();
+    const requestId = gitOperationRequestIdRef.current + 1;
+    gitOperationRequestIdRef.current = requestId;
+    const isCurrentOperation = () =>
+      gitOperationRequestIdRef.current === requestId &&
+      activeWorkspaceIdRef.current === workspaceId &&
+      sourceControlViewRef.current.workspaceId === workspaceId &&
+      sourceControlTargetKey(sourceControlViewRef.current.target) === targetKey;
     const operationKey = `${action}:${path}`;
     setGitOperationKey(operationKey);
     setDiffError(null);
 
     try {
       const data = await requestJson<GitDiffResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/${action}`,
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/git/${action}`,
         {
           body: JSON.stringify(
-            gitTargetRequestBody({ path }, sourceControlTarget),
+            gitTargetRequestBody({ path }, target),
           ),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
       );
+      if (!isCurrentOperation()) {
+        return;
+      }
+      invalidateGitDiffRequest();
       setGitDiff(data);
       setSelectedDiffPath(
         selectedDiffPath &&
@@ -9889,9 +10018,13 @@ export function App() {
           : null,
       );
     } catch (requestError) {
-      setDiffError(errorMessage(requestError));
+      if (isCurrentOperation()) {
+        setDiffError(errorMessage(requestError));
+      }
     } finally {
-      setGitOperationKey(null);
+      if (isCurrentOperation()) {
+        setGitOperationKey(null);
+      }
     }
   }
 
@@ -9909,27 +10042,46 @@ export function App() {
       return;
     }
 
+    const workspaceId = activeWorkspace.id;
+    const target = sourceControlTarget;
+    const targetKey = sourceControlTargetKey(target);
+    invalidateGitDiffRequest();
+    const requestId = gitOperationRequestIdRef.current + 1;
+    gitOperationRequestIdRef.current = requestId;
+    const isCurrentOperation = () =>
+      gitOperationRequestIdRef.current === requestId &&
+      activeWorkspaceIdRef.current === workspaceId &&
+      sourceControlViewRef.current.workspaceId === workspaceId &&
+      sourceControlTargetKey(sourceControlViewRef.current.target) === targetKey;
     setGitOperationKey("commit");
     setDiffError(null);
 
     try {
       const data = await requestJson<GitDiffResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/commit`,
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/git/commit`,
         {
           body: JSON.stringify(
-            gitTargetRequestBody({ message }, sourceControlTarget),
+            gitTargetRequestBody({ message }, target),
           ),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
       );
+      if (!isCurrentOperation()) {
+        return;
+      }
+      invalidateGitDiffRequest();
       setGitDiff(data);
       setGitCommitMessage("");
       setSelectedDiffPath(null);
     } catch (requestError) {
-      setDiffError(errorMessage(requestError));
+      if (isCurrentOperation()) {
+        setDiffError(errorMessage(requestError));
+      }
     } finally {
-      setGitOperationKey(null);
+      if (isCurrentOperation()) {
+        setGitOperationKey(null);
+      }
     }
   }
 
@@ -9948,12 +10100,23 @@ export function App() {
       return;
     }
 
+    const workspaceId = activeWorkspace.id;
+    const target = sourceControlTarget;
+    const targetKey = sourceControlTargetKey(target);
+    invalidateGitDiffRequest();
+    const requestId = gitOperationRequestIdRef.current + 1;
+    gitOperationRequestIdRef.current = requestId;
+    const isCurrentOperation = () =>
+      gitOperationRequestIdRef.current === requestId &&
+      activeWorkspaceIdRef.current === workspaceId &&
+      sourceControlViewRef.current.workspaceId === workspaceId &&
+      sourceControlTargetKey(sourceControlViewRef.current.target) === targetKey;
     setGitOperationKey("generate-commit-message");
     setDiffError(null);
 
     try {
       const data = await requestJson<GitCommitMessageResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/commit-message`,
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/git/commit-message`,
         {
           body: JSON.stringify(
             gitTargetRequestBody(
@@ -9961,18 +10124,24 @@ export function App() {
                 modelId: selectedModelId,
                 providerId: selectedProviderId,
               },
-              sourceControlTarget,
+              target,
             ),
           ),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
       );
-      setGitCommitMessage(data.message);
+      if (isCurrentOperation()) {
+        setGitCommitMessage(data.message);
+      }
     } catch (requestError) {
-      setDiffError(errorMessage(requestError));
+      if (isCurrentOperation()) {
+        setDiffError(errorMessage(requestError));
+      }
     } finally {
-      setGitOperationKey(null);
+      if (isCurrentOperation()) {
+        setGitOperationKey(null);
+      }
     }
   }
 
@@ -12207,11 +12376,16 @@ export function App() {
           }
 
           if (streamEvent.type === "gitDiffRefresh") {
-            if (isContextPanelOpen && contextPanelTab === "git") {
+            const sourceControlView = sourceControlViewRef.current;
+            if (
+              sourceControlView.isVisible &&
+              sourceControlView.workspaceId === streamEvent.workspaceId &&
+              sourceControlView.chatKey === chatKey
+            ) {
               void loadGitDiff(
                 streamEvent.workspaceId,
-                selectedDiffPath,
-                sourceControlTarget,
+                sourceControlView.selectedDiffPath,
+                sourceControlView.target,
               );
             }
             deferStreamAuxiliaryUpdate(() => {
@@ -13618,11 +13792,16 @@ export function App() {
         }
 
         if (streamEvent.type === "gitDiffRefresh") {
-          if (isContextPanelOpen && contextPanelTab === "git") {
+          const sourceControlView = sourceControlViewRef.current;
+          if (
+            sourceControlView.isVisible &&
+            sourceControlView.workspaceId === streamEvent.workspaceId &&
+            sourceControlView.chatKey === runMessagesKey
+          ) {
             void loadGitDiff(
               streamEvent.workspaceId,
-              selectedDiffPath,
-              sourceControlTarget,
+              sourceControlView.selectedDiffPath,
+              sourceControlView.target,
             );
           }
           deferStreamAuxiliaryUpdate(() => {
@@ -14362,6 +14541,22 @@ export function App() {
       if (!target) {
         return;
       }
+      invalidateGitDiffRequest();
+      gitOperationRequestIdRef.current += 1;
+      sourceControlTargetIdentityRef.current = [
+        activeWorkspace?.id ?? "",
+        sourceControlTargetKey(target),
+      ].join("\u0000");
+      sourceControlViewRef.current = {
+        ...sourceControlViewRef.current,
+        selectedDiffPath: null,
+        target,
+      };
+      setGitDiff(null);
+      setDiffError(null);
+      setIsLoadingDiff(false);
+      setGitOperationKey(null);
+      setGitCommitMessage("");
       setIsSourceControlTargetManual(true);
       setSelectedSourceControlTargetScope(sourceControlTargetScope);
       setSelectedSourceControlTarget(target);

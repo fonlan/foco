@@ -250,6 +250,7 @@ describe("app-panels-stats verification surfaces", () => {
   });
 
   it("switches Source Control targets without calling branch switch", async () => {
+    const user = userEvent.setup();
     const firstWorktreePath = `${workspace.path}\\.foco\\agent-worktrees\\agent-instance-coordinator`;
     const secondWorktreePath = `${workspace.path}\\.foco\\agent-worktrees\\agent-instance-review`;
     appTestState.agentTeamSnapshotResponse = {
@@ -315,11 +316,10 @@ describe("app-panels-stats verification surfaces", () => {
       files: [{ indexStatus: " ", path: "review.md", worktreeStatus: "M" }],
       status: " M review.md\n",
     };
-
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
-    await userEvent.click(await screen.findByRole("tab", { name: "Git" }));
+    await user.click(await screen.findByRole("tab", { name: "Git" }));
     const selectedTarget = (await screen.findAllByText(
       "foco/agent-worktrees/agent-instance-coordinator",
     )).find((element) => element.dataset.slot === "select-value");
@@ -336,17 +336,26 @@ describe("app-panels-stats verification surfaces", () => {
         name: "foco/agent-worktrees/agent-instance-coordinator",
       }),
     ).toBeNull();
-    await userEvent.click(targetSelect);
-    await userEvent.click(
+    await user.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "edit the active worktree",
+    );
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    await user.click(targetSelect);
+    await user.click(
       await screen.findByRole("option", {
         name: "foco/agent-worktrees/agent-instance-review",
       }),
     );
 
-    await screen.findByText("review.md");
     expect(targetSelect).toHaveTextContent(
       "foco/agent-worktrees/agent-instance-review",
     );
+    await screen.findByText("review.md");
     expect(
       fetchCallUrls().some(
         (url) =>
@@ -360,6 +369,300 @@ describe("app-panels-stats verification surfaces", () => {
           url.searchParams.get("worktreePath") === secondWorktreePath,
       ),
     ).toBe(true);
+
+    const firstTargetRequestsBeforeRefresh = fetchCallUrls().filter(
+      (url) =>
+        url.pathname === "/api/workspaces/workspace-1/git/diff" &&
+        url.searchParams.get("worktreePath") === firstWorktreePath,
+    ).length;
+    const secondTargetRequestsBeforeRefresh = fetchCallUrls().filter(
+      (url) =>
+        url.pathname === "/api/workspaces/workspace-1/git/diff" &&
+        url.searchParams.get("worktreePath") === secondWorktreePath,
+    ).length;
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        codeChangeStats: { additions: 1, deletions: 0 },
+        type: "gitDiffRefresh",
+        workspaceId: "workspace-1",
+      });
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(
+        fetchCallUrls().filter(
+          (url) =>
+            url.pathname === "/api/workspaces/workspace-1/git/diff" &&
+            url.searchParams.get("worktreePath") === secondWorktreePath,
+        ).length,
+      ).toBeGreaterThan(secondTargetRequestsBeforeRefresh),
+    );
+    expect(
+      fetchCallUrls().filter(
+        (url) =>
+          url.pathname === "/api/workspaces/workspace-1/git/diff" &&
+          url.searchParams.get("worktreePath") === firstWorktreePath,
+      ),
+    ).toHaveLength(firstTargetRequestsBeforeRefresh);
+    expect(screen.getByText("review.md")).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("keeps Source Control bound to the active workspace during background git refreshes", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.mocked(fetch);
+    appTestState.workspaceGitDiffResponse = generatedGitDiff;
+    const otherWorkspaceDiff = {
+      ...generatedGitDiff,
+      diff: [
+        "diff --git a/foreign.rs b/foreign.rs",
+        "--- /dev/null",
+        "+++ b/foreign.rs",
+        "@@ -0,0 +1 @@",
+        "+foreign workspace",
+        "",
+      ].join("\n"),
+      files: [{ indexStatus: " ", path: "foreign.rs", worktreeStatus: "M" }],
+      status: " M foreign.rs\n",
+    };
+    fetchMock.mockImplementation((input, init) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const url = new URL(rawUrl, "http://127.0.0.1");
+      if (url.pathname === "/api/workspaces/workspace-2/git/diff") {
+        return Promise.resolve(jsonResponse(otherWorkspaceDiff));
+      }
+      return mockFetch(input, init);
+    });
+
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Git" }));
+    expect(
+      await screen.findByRole("button", { name: /web\/App\.tsx M/ }),
+    ).toBeInTheDocument();
+
+    await user.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "edit in the background",
+    );
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        codeChangeStats: { additions: 1, deletions: 0 },
+        type: "gitDiffRefresh",
+        workspaceId: "workspace-2",
+      });
+      await Promise.resolve();
+    });
+
+    expect(
+      fetchCallUrls().some(
+        (url) => url.pathname === "/api/workspaces/workspace-2/git/diff",
+      ),
+    ).toBe(false);
+    expect(
+      screen.getByRole("button", { name: /web\/App\.tsx M/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /foreign\.rs M/ }),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("ignores a stale Git diff response after switching workspaces", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.mocked(fetch);
+    const staleWorkspaceDiff = deferred<Response>();
+    const otherWorkspaceDiff = {
+      ...generatedGitDiff,
+      diff: [
+        "diff --git a/side-project.rs b/side-project.rs",
+        "--- /dev/null",
+        "+++ b/side-project.rs",
+        "@@ -0,0 +1 @@",
+        "+side project",
+        "",
+      ].join("\n"),
+      files: [
+        { indexStatus: " ", path: "side-project.rs", worktreeStatus: "M" },
+      ],
+      status: " M side-project.rs\n",
+    };
+    fetchMock.mockImplementation((input, init) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const url = new URL(rawUrl, "http://127.0.0.1");
+      if (url.pathname === "/api/workspaces/workspace-1/git/diff") {
+        return staleWorkspaceDiff.promise;
+      }
+      if (url.pathname === "/api/workspaces/workspace-2/git/diff") {
+        return Promise.resolve(jsonResponse(otherWorkspaceDiff));
+      }
+      return mockFetch(input, init);
+    });
+
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Git" }));
+    await waitFor(() =>
+      expect(
+        fetchCallUrls().some(
+          (url) => url.pathname === "/api/workspaces/workspace-1/git/diff",
+        ),
+      ).toBe(true),
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") &&
+          accessibleName.startsWith("Side project"),
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: /Side note/ }));
+    expect(await screen.findByText("side-project.rs")).toBeInTheDocument();
+
+    await act(async () => {
+      staleWorkspaceDiff.resolve(jsonResponse(generatedGitDiff));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("side-project.rs")).toBeInTheDocument();
+    expect(screen.queryByText("web/App.tsx")).not.toBeInTheDocument();
+  });
+
+  it("ignores a stale Git operation response after switching workspaces", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.mocked(fetch);
+    appTestState.workspaceGitDiffResponse = generatedGitDiff;
+    const staleStageResponse = deferred<Response>();
+    const otherWorkspaceDiff = {
+      ...generatedGitDiff,
+      diff: [
+        "diff --git a/side-project.rs b/side-project.rs",
+        "--- /dev/null",
+        "+++ b/side-project.rs",
+        "@@ -0,0 +1 @@",
+        "+side project",
+        "",
+      ].join("\n"),
+      files: [
+        { indexStatus: " ", path: "side-project.rs", worktreeStatus: "M" },
+      ],
+      status: " M side-project.rs\n",
+    };
+    fetchMock.mockImplementation((input, init) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const url = new URL(rawUrl, "http://127.0.0.1");
+      if (url.pathname === "/api/workspaces/workspace-1/git/stage") {
+        return staleStageResponse.promise;
+      }
+      if (url.pathname === "/api/workspaces/workspace-2/git/diff") {
+        return Promise.resolve(jsonResponse(otherWorkspaceDiff));
+      }
+      return mockFetch(input, init);
+    });
+
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Git" }));
+    await screen.findByRole("button", { name: /web\/App\.tsx M/ });
+    await user.click(screen.getAllByRole("button", { name: "Stage file" })[0]!);
+    await waitFor(() =>
+      expect(
+        fetchCallUrls().some(
+          (url) => url.pathname === "/api/workspaces/workspace-1/git/stage",
+        ),
+      ).toBe(true),
+    );
+
+    await user.click(
+      screen.getByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") &&
+          accessibleName.startsWith("Side project"),
+      }),
+    );
+    await user.click(screen.getByRole("button", { name: /Side note/ }));
+    expect(await screen.findByText("side-project.rs")).toBeInTheDocument();
+
+    await act(async () => {
+      staleStageResponse.resolve(jsonResponse(generatedGitDiff));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("side-project.rs")).toBeInTheDocument();
+    expect(screen.queryByText("web/App.tsx")).not.toBeInTheDocument();
+  });
+
+  it("prevents a pre-mutation Git diff from overwriting the mutation result", async () => {
+    const user = userEvent.setup();
+    const fetchMock = vi.mocked(fetch);
+    const staleDiffResponse = deferred<Response>();
+    const stagedDiff = {
+      ...generatedGitDiff,
+      diff: [
+        "diff --git a/staged.ts b/staged.ts",
+        "--- /dev/null",
+        "+++ b/staged.ts",
+        "@@ -0,0 +1 @@",
+        "+staged after mutation",
+        "",
+      ].join("\n"),
+      files: [{ indexStatus: "M", path: "staged.ts", worktreeStatus: " " }],
+      stagedDiff: "diff --git a/staged.ts b/staged.ts",
+      stagedFiles: [
+        { indexStatus: "M", path: "staged.ts", worktreeStatus: " " },
+      ],
+      status: "M  staged.ts\n",
+    };
+    let diffRequestCount = 0;
+    fetchMock.mockImplementation((input, init) => {
+      const rawUrl = typeof input === "string" ? input : input.toString();
+      const url = new URL(rawUrl, "http://127.0.0.1");
+      if (url.pathname === "/api/workspaces/workspace-1/git/diff") {
+        diffRequestCount += 1;
+        return diffRequestCount === 2
+          ? staleDiffResponse.promise
+          : Promise.resolve(jsonResponse(generatedGitDiff));
+      }
+      if (url.pathname === "/api/workspaces/workspace-1/git/stage") {
+        return Promise.resolve(jsonResponse(stagedDiff));
+      }
+      return mockFetch(input, init);
+    });
+
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Git" }));
+    await screen.findByRole("button", { name: /web\/App\.tsx M/ });
+    await user.click(screen.getByRole("button", { name: "Refresh diff" }));
+    await waitFor(() => expect(diffRequestCount).toBe(2));
+    await user.click(screen.getAllByRole("button", { name: "Stage file" })[0]!);
+    expect(await screen.findAllByText("staged.ts")).not.toHaveLength(0);
+
+    await act(async () => {
+      staleDiffResponse.resolve(jsonResponse(generatedGitDiff));
+      await Promise.resolve();
+    });
+
+    expect(screen.getAllByText("staged.ts")).not.toHaveLength(0);
+    expect(screen.queryByText("web/App.tsx")).not.toBeInTheDocument();
   });
 
   function setDocumentVisibility(visibilityState: DocumentVisibilityState) {
