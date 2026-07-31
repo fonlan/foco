@@ -5064,6 +5064,122 @@ describe("app-chat-stream verification surfaces", () => {
     },
   );
 
+  it("keeps a durable final assistant response when an earlier messages snapshot resolves last", async () => {
+    const delayedMessages = deferred<Response>();
+    let messagesRequestCount = 0;
+    const assistantMessageId = "message-assistant-stream";
+    const staleMessagesPayload = {
+      messages: [
+        chatMessages.messages[0],
+        {
+          ...chatMessages.messages[1],
+          content: "Earlier persisted snapshot.",
+          id: assistantMessageId,
+          metrics: null,
+          parts: [
+            { text: "Earlier persisted snapshot.", type: "text" as const },
+          ],
+          reasoning: null,
+          status: "streaming",
+          toolCalls: [],
+        },
+      ],
+      activeRun: {
+        assistantMessageId,
+        chatId: "chat-1",
+        lastSequence: 0,
+        runId: "request-stream",
+        workspaceId: "workspace-1",
+      },
+    };
+    const staleMessagesWithoutTerminalAssistant = {
+      ...staleMessagesPayload,
+      messages: [chatMessages.messages[0]],
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          messagesRequestCount += 1;
+          return messagesRequestCount === 1
+            ? jsonResponse(staleMessagesPayload)
+            : delayedMessages.promise;
+        }
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() =>
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
+    );
+
+    // An alias mismatch deliberately begins a second `/messages` request. Keep
+    // that request behind a gate, then complete the same durable run first.
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "stale-assistant-alias",
+        delta: "trigger stale history reload",
+        type: "textDelta",
+      });
+    });
+    await waitFor(() => expect(messagesRequestCount).toBe(2));
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId,
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 42,
+          providerId: "provider-1",
+          totalLatencyMs: 100,
+        },
+        reasoning: "Durable final reasoning.",
+        stopReason: "completed",
+        text: "Durable final conclusion.",
+        type: "complete",
+      });
+    });
+
+    const finalConclusion = await screen.findByText("Durable final conclusion.");
+    const finalRow = finalConclusion.closest(".message-row");
+    expect(finalRow).not.toBeNull();
+    expect(finalRow).toHaveTextContent("Durable final reasoning.");
+
+    await act(async () => {
+      // This earlier page predates creation of the assistant entirely. The
+      // stale-load barrier must keep the anchored terminal bubble rather than
+      // treating a missing id as authority to delete it.
+      delayedMessages.resolve(jsonResponse(staleMessagesWithoutTerminalAssistant));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Durable final conclusion.")).toBeInTheDocument();
+      expect(
+        screen.queryByText("Earlier persisted snapshot."),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(/trigger stale history reload/),
+      ).not.toBeInTheDocument();
+    });
+    expect(finalRow).toHaveTextContent("Durable final reasoning.");
+    expect(within(finalRow as HTMLElement).queryByText("streaming")).toBeNull();
+
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream")?.close();
+    });
+  });
+
   it("keeps a background compression lifecycle cached until its tab is restored", async () => {
     renderApp();
 

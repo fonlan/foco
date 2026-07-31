@@ -490,6 +490,13 @@ export type MergeLoadedMessagesOptions = {
    * the live cache so an older server snapshot cannot erase them.
    */
   preserveLiveAgentTaskLifecycleParts?: boolean;
+  /**
+   * Assistant ids that changed after this `/messages` request began. For a
+   * proven same-run stale response, retain the local assistant wholesale so
+   * older text, reasoning, tool state, terminal status, and metrics cannot
+   * overwrite a newer SSE mutation.
+   */
+  preserveLiveAssistantMessageIds?: ReadonlySet<string>;
 };
 
 export type ContinuousActiveRunMatchInput = {
@@ -551,6 +558,7 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
     preserveDisjointActiveRunCache = false,
     preserveLiveContextCompressionParts = false,
     preserveLiveAgentTaskLifecycleParts = false,
+    preserveLiveAssistantMessageIds,
   } =
     typeof options === "boolean"
       ? {
@@ -614,6 +622,14 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
     );
   }
 
+  if (preserveLiveAssistantMessageIds?.size) {
+    nextMessages = overlayStaleLoadedAssistantMessages(
+      nextMessages,
+      cachedMessages,
+      preserveLiveAssistantMessageIds,
+    );
+  }
+
   // No id continuity with cache: do not resurrect orphan streaming from a
   // discarded thread. Disjoint active-run preserve already kept the full cache
   // (including any live streaming bubble) above.
@@ -664,6 +680,75 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
   }
 
   return { messages: nextMessages, preservedCachePrefix };
+}
+
+/**
+ * A `/messages` response is a point-in-time snapshot. Once an assistant has
+ * been changed by a later live event, its cached representation is the only
+ * monotonic view until a fresh request is made. This deliberately preserves
+ * only same-id assistants supplied by the caller's run/session proof; normal
+ * history reloads continue to replace the cache authoritatively.
+ */
+export function overlayStaleLoadedAssistantMessages(
+  loadedMessages: ShellMessage[],
+  cachedMessages: ShellMessage[],
+  liveAssistantMessageIds: ReadonlySet<string>,
+): ShellMessage[] {
+  const cachedAssistantsById = new Map(
+    cachedMessages
+      .filter((message) => message.role === "assistant")
+      .map((message) => [message.id, message]),
+  );
+
+  let nextMessages = loadedMessages.map((message) => {
+    if (
+      message.role !== "assistant" ||
+      !liveAssistantMessageIds.has(message.id)
+    ) {
+      return message;
+    }
+    return cachedAssistantsById.get(message.id) ?? message;
+  });
+
+  const loadedIds = new Set(nextMessages.map((message) => message.id));
+  for (const [cachedIndex, message] of cachedMessages.entries()) {
+    if (
+      message.role !== "assistant" ||
+      !liveAssistantMessageIds.has(message.id) ||
+      loadedIds.has(message.id)
+    ) {
+      continue;
+    }
+
+    // A stale response can predate creation of the terminal assistant and
+    // omit it entirely. Reinsert after the nearest stable predecessor from the
+    // cached timeline; never append blindly or restore an unanchored bubble.
+    let anchorId: string | null = null;
+    for (let index = cachedIndex - 1; index >= 0; index -= 1) {
+      const candidate = cachedMessages[index];
+      if (candidate && loadedIds.has(candidate.id)) {
+        anchorId = candidate.id;
+        break;
+      }
+    }
+    if (anchorId === null) {
+      continue;
+    }
+    const anchorIndex = nextMessages.findIndex(
+      (candidate) => candidate.id === anchorId,
+    );
+    if (anchorIndex < 0) {
+      continue;
+    }
+    nextMessages = [
+      ...nextMessages.slice(0, anchorIndex + 1),
+      message,
+      ...nextMessages.slice(anchorIndex + 1),
+    ];
+    loadedIds.add(message.id);
+  }
+
+  return nextMessages;
 }
 
 /**
@@ -1832,9 +1917,41 @@ export function App() {
   const liveMessageRevisionByChatKeyRef = useRef<Map<string, number>>(
     new Map(),
   );
-  function advanceLiveMessageRevision(chatKey: string) {
+  // A chat-level revision cheaply detects that a request raced any visible
+  // message update; assistant-level revisions identify exactly which bubbles
+  // must not be replaced by that stale snapshot.
+  const liveAssistantMessageRevisionByChatKeyRef = useRef<
+    Map<string, Map<string, number>>
+  >(new Map());
+  function advanceLiveMessageRevision(
+    chatKey: string,
+    previousMessages: ShellMessage[] = [],
+    nextMessages: ShellMessage[] = [],
+  ) {
     const revisions = liveMessageRevisionByChatKeyRef.current;
-    revisions.set(chatKey, (revisions.get(chatKey) ?? 0) + 1);
+    const revision = (revisions.get(chatKey) ?? 0) + 1;
+    revisions.set(chatKey, revision);
+
+    const previousAssistantsById = new Map(
+      previousMessages
+        .filter((message) => message.role === "assistant")
+        .map((message) => [message.id, message]),
+    );
+    const assistantRevisions =
+      liveAssistantMessageRevisionByChatKeyRef.current.get(chatKey) ??
+      new Map<string, number>();
+    for (const message of nextMessages) {
+      if (
+        message.role === "assistant" &&
+        previousAssistantsById.get(message.id) !== message
+      ) {
+        assistantRevisions.set(message.id, revision);
+      }
+    }
+    liveAssistantMessageRevisionByChatKeyRef.current.set(
+      chatKey,
+      assistantRevisions,
+    );
   }
   const cachedChatAccessOrderRef = useRef<string[]>([]);
   const trimmedChatCacheKeysRef = useRef<Set<string>>(new Set());
@@ -6024,7 +6141,11 @@ export function App() {
     }
 
     const currentByKey = chatMessagesByKeyRef.current;
-    const nextForKey = resolveNext(currentByKey[chatKey] ?? []);
+    const currentForKey = currentByKey[chatKey] ?? [];
+    const nextForKey = resolveNext(currentForKey);
+    if (nextForKey !== currentForKey) {
+      advanceLiveMessageRevision(chatKey, currentForKey, nextForKey);
+    }
     const nextByKey = { ...currentByKey, [chatKey]: nextForKey };
     setChatMessagesByKey(nextByKey);
     rememberChatCacheAccess(chatKey);
@@ -7589,6 +7710,18 @@ export function App() {
       chatMessagesByKeyRef.current[chatKey] !== undefined;
     const liveRevisionBeforeLoad =
       liveMessageRevisionByChatKeyRef.current.get(chatKey) ?? 0;
+    const liveAssistantRevisionsBeforeLoad = new Map(
+      liveAssistantMessageRevisionByChatKeyRef.current.get(chatKey),
+    );
+    // Preserve the run identity from the instant this request starts. The
+    // complete handler clears activeRunInfo before it writes the terminal
+    // assistant, so response-time state alone cannot distinguish that durable
+    // terminal from an unrelated ordinary history refresh.
+    const liveRunIdBeforeLoad =
+      expectedStreamSession?.runId ??
+      chatStreamSessionsByChatKeyRef.current.get(chatKey)?.runId ??
+      activeRunInfoByChatKeyRef.current[chatKey]?.runId ??
+      null;
     loadingChatKeysRef.current.add(chatKey);
     const controller = new AbortController();
     loadingChatControllersRef.current.set(chatKey, controller);
@@ -7654,6 +7787,28 @@ export function App() {
       const staleAfterLiveMessageRevision =
         (liveMessageRevisionByChatKeyRef.current.get(chatKey) ?? 0) >
         liveRevisionBeforeLoad;
+      const liveAssistantMessageIds = new Set(
+        Array.from(
+          liveAssistantMessageRevisionByChatKeyRef.current.get(chatKey) ?? [],
+        )
+          .filter(
+            ([assistantMessageId, revision]) =>
+              revision >
+              (liveAssistantRevisionsBeforeLoad.get(assistantMessageId) ?? 0),
+          )
+          .map(([assistantMessageId]) => assistantMessageId),
+      );
+      const durableTerminalRunId =
+        durableRunTerminationByChatKeyRef.current.get(chatKey)?.runId ?? null;
+      const currentStreamRunId =
+        chatStreamSessionsByChatKeyRef.current.get(chatKey)?.runId ?? null;
+      const staleSnapshotBelongsToLiveRun =
+        liveRunIdBeforeLoad !== null &&
+        (sameContinuousLocalRun ||
+          durableTerminalRunId === liveRunIdBeforeLoad ||
+          (currentStreamRunId === liveRunIdBeforeLoad &&
+            (activeRun?.runId === null ||
+              activeRun?.runId === liveRunIdBeforeLoad)));
       const mergeResult = mergeLoadedMessagesWithStreamingPlaceholders(
         normalizedMessages,
         cachedMessages,
@@ -7672,6 +7827,13 @@ export function App() {
           // not require the load to overlap a local live revision.
           preserveLiveAgentTaskLifecycleParts:
             (sameContinuousLocalRun || Boolean(activeRun)),
+          // A stale same-run response must never regress live text, reasoning,
+          // tools, or the durable terminal shape. Assistant revisions make this
+          // narrow: unrelated assistant messages still use server history.
+          preserveLiveAssistantMessageIds:
+            staleAfterLiveMessageRevision && staleSnapshotBelongsToLiveRun
+              ? liveAssistantMessageIds
+              : undefined,
           preserveStreamingPlaceholders,
         },
       );
@@ -11770,7 +11932,6 @@ export function App() {
           }
 
           if (streamEvent.type === "contextCompression") {
-            advanceLiveMessageRevision(chatKey);
             setMessagesForChatKey(chatKey, (current) =>
               current.map((message) =>
                 isCurrentAssistantMessage(
@@ -11788,7 +11949,6 @@ export function App() {
           }
 
           if (streamEvent.type === "agentTaskLifecycle") {
-            advanceLiveMessageRevision(chatKey);
             setMessagesForChatKey(chatKey, (current) =>
               current.map((message) =>
                 message.role === "assistant" &&
@@ -13182,7 +13342,6 @@ export function App() {
         }
 
         if (streamEvent.type === "contextCompression") {
-          advanceLiveMessageRevision(runMessagesKey);
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -13200,7 +13359,6 @@ export function App() {
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
-          advanceLiveMessageRevision(runMessagesKey);
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               message.role === "assistant" &&
@@ -17598,6 +17756,16 @@ function completedAssistantMessage(
   const textDelta = missingFinalSuffix(message.content, streamEvent.text);
   if (textDelta) {
     parts = appendTextPart(parts, textDelta);
+  } else if (
+    streamEvent.text &&
+    message.content !== streamEvent.text &&
+    !message.content.includes(streamEvent.text)
+  ) {
+    // Complete is authoritative, but don't append a second whole conclusion
+    // behind an incompatible stale draft. Replace the terminal text block so
+    // tool/reasoning blocks retain their timeline position and the UI has one
+    // visible final body.
+    parts = replaceLastTextPart(parts, streamEvent.text);
   }
 
   return {
@@ -17908,6 +18076,24 @@ function appendTextPart(
       text: lastPart.text + text,
     },
   ];
+}
+
+function replaceLastTextPart(
+  parts: ChatMessagePart[],
+  text: string,
+): ChatMessagePart[] {
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    const part = parts[index];
+    if (part?.type !== "text") {
+      continue;
+    }
+    return [
+      ...parts.slice(0, index),
+      { ...part, text },
+      ...parts.slice(index + 1),
+    ];
+  }
+  return text ? [...parts, { type: "text", text }] : parts;
 }
 
 function appendErrorPart(
