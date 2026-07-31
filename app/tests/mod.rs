@@ -37816,6 +37816,7 @@ async fn run_provider_stream_for_text_returns_readable_timeout() {
     let capture = ProviderAuditCapture::new(Path::new("."), "llm-model-test", false);
     let error = match run_provider_stream_for_text(
         &provider_config,
+        true,
         request,
         "model availability test",
         1,
@@ -37908,6 +37909,7 @@ async fn audited_single_tool_request_recovers_thinking_tool_choice_400_with_auto
         Some("chat-1"),
         "provider",
         &provider_config,
+        true,
         NeutralChatRequest {
             model_id: "model".to_string(),
             messages: vec![neutral_text_message(
@@ -38100,6 +38102,7 @@ async fn audited_single_tool_request_deepseek_omits_tool_choice_and_preserves_au
             request_overrides: Vec::new(),
             model_redirects: Vec::new(),
         },
+        true,
         NeutralChatRequest {
             model_id: "deepseek-chat".to_string(),
             messages: vec![neutral_text_message(
@@ -38232,6 +38235,7 @@ async fn audited_single_tool_request_does_not_repair_an_unrelated_http_400() {
             request_overrides: Vec::new(),
             model_redirects: Vec::new(),
         },
+        true,
         NeutralChatRequest {
             model_id: "model".to_string(),
             messages: vec![neutral_text_message(
@@ -38335,6 +38339,7 @@ async fn audited_single_tool_request_stops_after_compatibility_repair_returns_pr
             request_overrides: Vec::new(),
             model_redirects: Vec::new(),
         },
+        true,
         NeutralChatRequest {
             model_id: "model".to_string(),
             messages: vec![neutral_text_message(

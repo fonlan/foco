@@ -2,7 +2,8 @@ use std::{collections::HashSet, time::Duration};
 
 use foco_agent::{ContextPackItem, context_compression_trigger_tokens, estimate_text_tokens};
 use foco_providers::{
-    NeutralChatMessage, NeutralChatRole, NeutralToolCall, stream_chat_with_capture_observer,
+    ChatRequestRuntimeOptions, NeutralChatMessage, NeutralChatRole, NeutralToolCall,
+    stream_chat_with_capture_observer_runtime_options,
 };
 use foco_store::config::PromptSettings;
 use foco_store::workspace::{
@@ -683,6 +684,10 @@ async fn ensure_llm_context_compression(
             model_id: Some(&context.model_id),
             provider_id: Some(&context.provider_id),
             provider_config: Some(&context.provider_config),
+            developer_role_enabled: crate::developer_role_enabled_for_model(
+                &context.global_config,
+                &context.model_id,
+            ),
             llm_request_retry_count: context.global_config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -840,6 +845,10 @@ async fn ensure_llm_context_compression(
             model_id: Some(&context.model_id),
             provider_id: Some(&context.provider_id),
             provider_config: Some(&context.provider_config),
+            developer_role_enabled: crate::developer_role_enabled_for_model(
+                &context.global_config,
+                &context.model_id,
+            ),
             llm_request_retry_count: context.global_config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -1708,9 +1717,19 @@ async fn llm_context_compression_summary_once(
     let capture_details = observer.is_some();
     let mut stream = match timeout(
         request_timeout,
-        stream_chat_with_capture_observer(
+        stream_chat_with_capture_observer_runtime_options(
             &context.provider_config,
             request,
+            ChatRequestRuntimeOptions {
+                developer_role_enabled: context
+                    .global_config
+                    .models
+                    .iter()
+                    .find(|model| model.id == context.model_id)
+                    .map(|model| model.developer_role_enabled)
+                    .unwrap_or(true),
+                ..Default::default()
+            },
             capture_details,
             observer,
             None,

@@ -435,7 +435,7 @@ async fn relevant_memory_facts_llm(
         return Ok(RelevantMemoryFacts { facts: Vec::new() });
     }
 
-    let (model_id, provider_id, provider_config, max_output_tokens) =
+    let (model_id, provider_id, provider_config, max_output_tokens, developer_role_enabled) =
         memory_retrieval_provider_for_model(config, chat_model, chat_provider)?;
     let system_prompt = effective_memory_retrieval_system_prompt(&config.prompts);
     let request = memory_retrieval_provider_request(
@@ -451,6 +451,7 @@ async fn relevant_memory_facts_llm(
         chat_id,
         &provider_id,
         &provider_config,
+        developer_role_enabled,
         request,
         config.memory.retrieval_llm_timeout_ms,
         config.app.llm_request_retry_count,
@@ -680,7 +681,7 @@ fn memory_retrieval_provider_for_model(
     config: &GlobalConfig,
     chat_model: &ModelSettings,
     chat_provider: &ProviderSettings,
-) -> Result<(String, String, ProviderConnectionConfig, u32), ApiError> {
+) -> Result<(String, String, ProviderConnectionConfig, u32, bool), ApiError> {
     let model = match config.memory.retrieval_model_id.as_deref() {
         Some(model_id) => config
             .models
@@ -754,6 +755,7 @@ fn memory_retrieval_provider_for_model(
         provider.id.clone(),
         provider_connection_config(provider)?,
         max_output_tokens,
+        model.developer_role_enabled,
     ))
 }
 

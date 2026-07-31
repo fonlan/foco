@@ -1127,14 +1127,41 @@ pub enum LatencyMode {
 ///
 /// These parameters are intentionally separate from `NeutralChatRequest` so internal one-shot
 /// calls retain the default behavior unless an explicit user chat/agent run opts in.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChatRequestRuntimeOptions {
     #[serde(default)]
     pub latency_mode: LatencyMode,
+    /// Whether the provider wire may retain the neutral `developer` role.
+    ///
+    /// Kept out of [`NeutralChatRequest`] so persisted prompt/history messages retain their
+    /// original role. Omitting this option preserves the existing developer-role behavior.
+    #[serde(
+        default = "default_developer_role_enabled",
+        skip_serializing_if = "is_true"
+    )]
+    pub developer_role_enabled: bool,
     /// Optional per-request sampling override for user-visible chat runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+}
+
+impl Default for ChatRequestRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            latency_mode: LatencyMode::Standard,
+            developer_role_enabled: true,
+            temperature: None,
+        }
+    }
+}
+
+fn default_developer_role_enabled() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 /// Return whether this provider route can expose the Fast latency mode for `model_id`.
@@ -2097,6 +2124,9 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
     request_observer: Option<ProviderRequestDumpObserver>,
     session_ctx: Option<ProviderWsSessionContext>,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
+    // Normalize once, before adapters, request overrides, and wire observers. This is the sole
+    // outbound role boundary: callers keep Developer semantics in prompt construction/history.
+    let request = normalize_request_developer_role(request, &runtime_options);
     if config.kind.uses_websocket() {
         return stream_chat_with_capture_observer_websocket(
             config,
@@ -2216,6 +2246,20 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
         final_response_dump: None,
         stream_diagnostics,
     })
+}
+
+fn normalize_request_developer_role(
+    mut request: NeutralChatRequest,
+    runtime_options: &ChatRequestRuntimeOptions,
+) -> NeutralChatRequest {
+    if !runtime_options.developer_role_enabled {
+        for message in &mut request.messages {
+            if message.role == NeutralChatRole::Developer {
+                message.role = NeutralChatRole::System;
+            }
+        }
+    }
+    request
 }
 
 async fn stream_chat_with_capture_observer_websocket(
@@ -5025,6 +5069,7 @@ mod tests {
     fn fast_latency_runtime_options_serialize_as_camel_case() {
         let value = serde_json::to_value(ChatRequestRuntimeOptions {
             latency_mode: LatencyMode::Fast,
+            developer_role_enabled: true,
             temperature: None,
         })
         .expect("serialize runtime options");
@@ -5063,6 +5108,7 @@ mod tests {
             &request,
             &ChatRequestRuntimeOptions {
                 latency_mode: LatencyMode::Fast,
+                developer_role_enabled: true,
                 temperature: None,
             },
         )
@@ -5091,6 +5137,7 @@ mod tests {
             &request,
             &ChatRequestRuntimeOptions {
                 latency_mode: LatencyMode::Fast,
+                developer_role_enabled: true,
                 temperature: None,
             },
         )
@@ -5404,6 +5451,7 @@ mod tests {
             &request,
             &ChatRequestRuntimeOptions {
                 latency_mode: LatencyMode::Fast,
+                developer_role_enabled: true,
                 temperature: None,
             },
         )
@@ -5445,6 +5493,7 @@ mod tests {
             request,
             ChatRequestRuntimeOptions {
                 latency_mode: LatencyMode::Fast,
+                developer_role_enabled: true,
                 temperature: None,
             },
             true,
@@ -5472,6 +5521,230 @@ mod tests {
         )
         .expect("raw HTTP request UTF-8");
         assert!(raw_request.contains("\"service_tier\":\"priority\""));
+    }
+
+    #[tokio::test]
+    async fn disabled_developer_role_is_absent_from_captured_openai_responses_wire_request() {
+        let response = concat!(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-role-fixture\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "Base system."),
+            neutral_text_message(NeutralChatRole::Developer, "Developer instructions."),
+            neutral_text_message(NeutralChatRole::User, "Continue."),
+        ]);
+        request.model_id = "gpt-4.1-mini".to_string();
+
+        let mut stream = stream_chat_with_capture_runtime_options(
+            &config,
+            request,
+            ChatRequestRuntimeOptions {
+                developer_role_enabled: false,
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("open Responses fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("captured wire request")
+            .as_http()
+            .expect("HTTP wire request");
+        let body =
+            serde_json::from_str::<Value>(dump.body.as_deref().expect("captured request body"))
+                .expect("request JSON");
+
+        assert_eq!(
+            body["instructions"],
+            "Base system.\n\nDeveloper instructions."
+        );
+        assert!(
+            !dump
+                .body
+                .as_deref()
+                .expect("captured request body")
+                .contains("\"developer\"")
+        );
+
+        while stream.next_event().await.is_some() {}
+        let raw_request = String::from_utf8(
+            fixture
+                .await
+                .expect("fixture task")
+                .into_iter()
+                .next()
+                .expect("fixture request"),
+        )
+        .expect("UTF-8 request");
+        assert!(!raw_request.contains("\"developer\""));
+    }
+
+    #[tokio::test]
+    async fn developer_role_policy_shapes_openai_chat_wire_request() {
+        let response = concat!(
+            "data: {\"id\":\"resp-role-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\\n\\n",
+            "data: {\"id\":\"resp-role-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\\n\\n",
+            "data: [DONE]\\n\\n"
+        );
+        let (disabled_fixture_root, disabled_fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let disabled_config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind"),
+            base_url: Some(format!("{disabled_fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "Base system."),
+            neutral_text_message(NeutralChatRole::Developer, "Developer instructions."),
+            neutral_text_message(NeutralChatRole::User, "Continue."),
+        ]);
+
+        let mut disabled_stream = stream_chat_with_capture_runtime_options(
+            &disabled_config,
+            request.clone(),
+            ChatRequestRuntimeOptions {
+                developer_role_enabled: false,
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("open disabled chat fixture stream");
+        let disabled_dump = disabled_stream
+            .wire_request_dump()
+            .expect("disabled wire request")
+            .as_http()
+            .expect("disabled HTTP wire request");
+        let disabled_body: Value = serde_json::from_str(
+            disabled_dump
+                .body
+                .as_deref()
+                .expect("disabled request body"),
+        )
+        .expect("disabled request JSON");
+        assert_eq!(
+            disabled_body["messages"][0],
+            serde_json::json!({
+                "role": "system",
+                "content": "Base system.\n\nDeveloper instructions."
+            })
+        );
+        assert!(!disabled_body.to_string().contains("\"developer\""));
+        while disabled_stream.next_event().await.is_some() {}
+        let disabled_raw = String::from_utf8(
+            disabled_fixture
+                .await
+                .expect("disabled fixture task")
+                .into_iter()
+                .next()
+                .expect("disabled fixture request"),
+        )
+        .expect("disabled raw request UTF-8");
+        assert!(!disabled_raw.contains("\"developer\""));
+
+        let (enabled_fixture_root, enabled_fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let enabled_config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind"),
+            base_url: Some(format!("{enabled_fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut enabled_stream = stream_chat_with_capture_runtime_options(
+            &enabled_config,
+            request,
+            ChatRequestRuntimeOptions::default(),
+            true,
+        )
+        .await
+        .expect("open enabled chat fixture stream");
+        let enabled_dump = enabled_stream
+            .wire_request_dump()
+            .expect("enabled wire request")
+            .as_http()
+            .expect("enabled HTTP wire request");
+        let enabled_body: Value =
+            serde_json::from_str(enabled_dump.body.as_deref().expect("enabled request body"))
+                .expect("enabled request JSON");
+        assert_eq!(enabled_body["messages"][1]["role"], "developer");
+        while enabled_stream.next_event().await.is_some() {}
+        let enabled_raw = String::from_utf8(
+            enabled_fixture
+                .await
+                .expect("enabled fixture task")
+                .into_iter()
+                .next()
+                .expect("enabled fixture request"),
+        )
+        .expect("enabled raw request UTF-8");
+        assert!(enabled_raw.contains("\"role\":\"developer\""));
+    }
+
+    #[tokio::test]
+    async fn disabled_developer_role_is_absent_from_openai_responses_websocket_payload() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some("https://gateway.example/v1/".to_string()),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "Base system."),
+            neutral_text_message(NeutralChatRole::Developer, "Developer instructions."),
+            neutral_text_message(NeutralChatRole::User, "Continue."),
+        ]);
+        let normalized = normalize_request_developer_role(
+            request,
+            &ChatRequestRuntimeOptions {
+                developer_role_enabled: false,
+                ..Default::default()
+            },
+        );
+        let chat_request =
+            genai_chat_request_for_adapter(&normalized, config.kind.adapter_kind()).expect("chat");
+        let options = genai_chat_options_with_runtime_options(
+            &config,
+            &normalized,
+            &ChatRequestRuntimeOptions {
+                developer_role_enabled: false,
+                ..Default::default()
+            },
+        )
+        .expect("options");
+        let client = config.genai_client().expect("client");
+        let prepared = client
+            .prepare_chat_stream_request(
+                genai::ModelIden::new(config.kind.adapter_kind(), "gpt-4.1-mini"),
+                chat_request,
+                Some(&options),
+            )
+            .await
+            .expect("prepare Responses request");
+        let payload = genai::adapter::openai_resp_websocket_create_payload(prepared.payload);
+
+        assert_eq!(
+            payload["instructions"],
+            "Base system.\n\nDeveloper instructions."
+        );
+        assert!(!payload.to_string().contains("\"developer\""));
     }
 
     #[tokio::test]
@@ -5503,7 +5776,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn websocket_stream_maps_to_neutral_events_and_closes_cleanly() {
+    async fn websocket_stream_applies_disabled_developer_role_before_the_wire_request() {
         use futures_util::{SinkExt, StreamExt};
         use tokio::net::TcpListener;
         use tokio_tungstenite::{accept_async, tungstenite::Message};
@@ -5521,6 +5794,11 @@ mod tests {
             let create: Value = serde_json::from_str(&text).expect("json");
             assert_eq!(create["type"], "response.create");
             assert!(create.get("stream").is_none());
+            assert_eq!(
+                create["instructions"],
+                "Base system.\n\nDeveloper instructions."
+            );
+            assert!(!text.contains("\"developer\""));
 
             for frame in [
                 r#"{"type":"response.output_text.delta","delta":"Hello"}"#,
@@ -5541,15 +5819,11 @@ mod tests {
         };
         let request = NeutralChatRequest {
             model_id: "gpt-4.1-mini".to_string(),
-            messages: vec![NeutralChatMessage {
-                role: NeutralChatRole::User,
-                content: "hi".to_string(),
-                attachments: vec![],
-                reasoning: None,
-                tool_calls: vec![],
-                tool_call_id: None,
-                tool_name: None,
-            }],
+            messages: vec![
+                neutral_text_message(NeutralChatRole::System, "Base system."),
+                neutral_text_message(NeutralChatRole::Developer, "Developer instructions."),
+                neutral_text_message(NeutralChatRole::User, "hi"),
+            ],
             tools: vec![],
             max_output_tokens: None,
             thinking_level: None,
@@ -5559,9 +5833,17 @@ mod tests {
             tool_choice: NeutralToolChoice::Auto,
         };
 
-        let mut stream = stream_chat_with_capture(&config, request, true)
-            .await
-            .expect("stream");
+        let mut stream = stream_chat_with_capture_runtime_options(
+            &config,
+            request,
+            ChatRequestRuntimeOptions {
+                developer_role_enabled: false,
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("stream");
         let wire = stream
             .wire_request_dump()
             .expect("wire request dump")
@@ -5577,6 +5859,11 @@ mod tests {
             wire.create_frame
                 .as_deref()
                 .is_some_and(|frame| frame.contains("\"type\":\"response.create\""))
+        );
+        assert!(
+            wire.create_frame
+                .as_deref()
+                .is_some_and(|frame| !frame.contains("\"developer\""))
         );
         assert_eq!(
             wire.headers
@@ -6938,6 +7225,49 @@ mod tests {
     }
 
     #[test]
+    fn disabled_developer_role_normalizes_only_the_outbound_request_before_system_merging() {
+        let request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "Base system."),
+            neutral_text_message(NeutralChatRole::Developer, "## Skills\n\n- Name: html-ppt"),
+            neutral_text_message(NeutralChatRole::User, "Continue."),
+        ]);
+
+        let normalized = normalize_request_developer_role(
+            request.clone(),
+            &ChatRequestRuntimeOptions {
+                developer_role_enabled: false,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(request.messages[1].role, NeutralChatRole::Developer);
+        assert_eq!(normalized.messages[1].role, NeutralChatRole::System);
+        assert_eq!(normalized.messages[1].content, request.messages[1].content);
+        assert_eq!(normalized.messages[2].role, NeutralChatRole::User);
+
+        let chat_request = genai_chat_request(&normalized).expect("normalized chat request");
+        assert_eq!(
+            chat_request.system.as_deref(),
+            Some("Base system.\n\n## Skills\n\n- Name: html-ppt")
+        );
+        assert_eq!(chat_request.messages.len(), 1);
+        assert_eq!(chat_request.messages[0].role, genai::chat::ChatRole::User);
+    }
+
+    #[test]
+    fn default_developer_role_policy_preserves_developer_messages() {
+        let request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::Developer,
+            "Developer prompt.",
+        )]);
+
+        let normalized =
+            normalize_request_developer_role(request, &ChatRequestRuntimeOptions::default());
+
+        assert_eq!(normalized.messages[0].role, NeutralChatRole::Developer);
+    }
+
+    #[test]
     fn validates_developer_messages_as_instructions() {
         let mut with_attachment =
             neutral_text_message(NeutralChatRole::Developer, "Developer prompt.");
@@ -7312,6 +7642,7 @@ mod tests {
             &request,
             &ChatRequestRuntimeOptions {
                 latency_mode: LatencyMode::Standard,
+                developer_role_enabled: true,
                 temperature: Some(0.7),
             },
         )

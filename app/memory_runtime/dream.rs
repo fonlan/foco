@@ -2051,6 +2051,7 @@ async fn call_memory_dream_planner_provider(
         planner.audit_chat_id,
         &selection.provider_id,
         &selection.provider_config,
+        crate::developer_role_enabled_for_model(planner.config, &request.model_id),
         request,
         "memory Dream planner",
         MEMORY_DREAM_PLANNER_TOOL_NAME,

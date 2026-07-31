@@ -37,8 +37,7 @@ use foco_providers::{
     OpenAiRespWsSessionRegistry, ProviderConfigError, ProviderConnectionConfig,
     ProviderRequestFailure, ProviderRequestOverride, ProviderWsSessionContext, WebSearchMode,
     normalized_proxy_url, parse_provider_kind, recover_model_json_from_text,
-    stream_chat_with_capture_observer, stream_chat_with_capture_observer_runtime_options,
-    upstream_provider_model_id,
+    stream_chat_with_capture_observer_runtime_options, upstream_provider_model_id,
 };
 #[cfg(test)]
 use foco_store::config::DEFAULT_TERMINAL_SHELL;
@@ -3008,6 +3007,15 @@ pub(crate) fn effective_chat_latency_mode(
     })
 }
 
+pub(crate) fn developer_role_enabled_for_model(config: &GlobalConfig, model_id: &str) -> bool {
+    config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .map(|model| model.developer_role_enabled)
+        .unwrap_or(true)
+}
+
 impl PreparedChatContext {
     pub(crate) fn attach_agent_correlation(
         &self,
@@ -3830,6 +3838,13 @@ impl PreparedChatContext {
                             turn_request,
                             foco_providers::ChatRequestRuntimeOptions {
                                 latency_mode: self.latency_mode,
+                                developer_role_enabled: self
+                                    .global_config
+                                    .models
+                                    .iter()
+                                    .find(|model| model.id == self.model_id)
+                                    .map(|model| model.developer_role_enabled)
+                                    .unwrap_or(true),
                                 temperature: plan_mode_temperature(self.session_mode.as_deref()),
                             },
                             api_audit_save_details(&self.global_config),
@@ -4752,6 +4767,10 @@ impl PreparedChatContext {
                                     model_id: Some(&self.model_id),
                                     provider_id: Some(&self.provider_id),
                                     provider_config: Some(&self.provider_config),
+                                    developer_role_enabled: developer_role_enabled_for_model(
+                                        &self.global_config,
+                                        &self.model_id,
+                                    ),
                                     llm_request_retry_count: self.global_config.app.llm_request_retry_count,
                                     permission_mode: None,
                                     payload: json!({
@@ -5388,6 +5407,10 @@ impl PreparedChatContext {
                                 model_id: Some(&self.model_id),
                                 provider_id: Some(&self.provider_id),
                                 provider_config: Some(&self.provider_config),
+                                developer_role_enabled: developer_role_enabled_for_model(
+                                    &self.global_config,
+                                    &self.model_id,
+                                ),
                                 llm_request_retry_count: self.global_config.app.llm_request_retry_count,
                                 permission_mode: None,
                                 payload: json!({
@@ -5819,6 +5842,10 @@ async fn prepare_chat_context_for_output(
             model_id: Some(&prompt_context.model_id),
             provider_id: Some(&prompt_context.provider_id),
             provider_config: Some(&prompt_context.provider_config),
+            developer_role_enabled: developer_role_enabled_for_model(
+                &config,
+                &prompt_context.model_id,
+            ),
             llm_request_retry_count: config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -5882,6 +5909,10 @@ async fn prepare_chat_context_for_output(
             model_id: Some(&prompt_context.model_id),
             provider_id: Some(&prompt_context.provider_id),
             provider_config: Some(&prompt_context.provider_config),
+            developer_role_enabled: developer_role_enabled_for_model(
+                &config,
+                &prompt_context.model_id,
+            ),
             llm_request_retry_count: config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -6386,6 +6417,7 @@ pub(crate) async fn generate_git_commit_message(
         None,
         provider_id,
         &provider_connection_config(provider)?,
+        developer_role_enabled_for_model(config, &request.model_id),
         request,
         GIT_COMMIT_MESSAGE_REQUEST_KIND,
         GIT_COMMIT_MESSAGE_TOOL_NAME,
@@ -6405,6 +6437,7 @@ pub(crate) async fn audited_provider_text_request(
     chat_id: Option<&str>,
     provider_id: &str,
     provider_config: &ProviderConnectionConfig,
+    developer_role_enabled: bool,
     request: NeutralChatRequest,
     request_kind: &str,
     timeout_ms: u64,
@@ -6485,6 +6518,7 @@ pub(crate) async fn audited_provider_text_request(
         }
         let result = run_provider_stream_for_text(
             provider_config,
+            developer_role_enabled,
             attempt_request,
             request_kind,
             timeout_ms,
@@ -6589,6 +6623,7 @@ pub(crate) async fn audited_provider_tool_request(
     chat_id: Option<&str>,
     provider_id: &str,
     provider_config: &ProviderConnectionConfig,
+    developer_role_enabled: bool,
     request: NeutralChatRequest,
     request_kind: &str,
     expected_tool_name: &str,
@@ -6603,6 +6638,7 @@ pub(crate) async fn audited_provider_tool_request(
         chat_id,
         provider_id,
         provider_config,
+        developer_role_enabled,
         request,
         request_kind,
         expected_tool_name,
@@ -6625,6 +6661,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
     chat_id: Option<&str>,
     provider_id: &str,
     provider_config: &ProviderConnectionConfig,
+    developer_role_enabled: bool,
     request: NeutralChatRequest,
     request_kind: &str,
     expected_tool_name: &str,
@@ -6746,6 +6783,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
         }
         let result = run_provider_stream_for_tool(
             provider_config,
+            developer_role_enabled,
             attempt_request,
             request_kind,
             expected_tool_name,
@@ -7201,6 +7239,7 @@ impl AuditedProviderError {
 
 async fn run_provider_stream_for_text(
     provider_config: &ProviderConnectionConfig,
+    developer_role_enabled: bool,
     request: NeutralChatRequest,
     request_kind: &str,
     timeout_ms: u64,
@@ -7211,9 +7250,13 @@ async fn run_provider_stream_for_text(
     let capture_details = observer.is_some();
     let mut stream = timeout(
         remaining_llm_request_timeout(started_at, timeout_ms),
-        stream_chat_with_capture_observer(
+        stream_chat_with_capture_observer_runtime_options(
             provider_config,
             request,
+            foco_providers::ChatRequestRuntimeOptions {
+                developer_role_enabled,
+                ..Default::default()
+            },
             capture_details,
             observer,
             None,
@@ -7352,6 +7395,7 @@ async fn run_provider_stream_for_text(
 
 async fn run_provider_stream_for_tool(
     provider_config: &ProviderConnectionConfig,
+    developer_role_enabled: bool,
     request: NeutralChatRequest,
     request_kind: &str,
     expected_tool_name: &str,
@@ -7365,9 +7409,13 @@ async fn run_provider_stream_for_tool(
     let capture_details = observer.is_some();
     let mut stream = timeout(
         remaining_llm_request_timeout(started_at, timeout_ms),
-        stream_chat_with_capture_observer(
+        stream_chat_with_capture_observer_runtime_options(
             provider_config,
             request,
+            foco_providers::ChatRequestRuntimeOptions {
+                developer_role_enabled,
+                ..Default::default()
+            },
             capture_details,
             observer,
             None,
@@ -8311,6 +8359,10 @@ async fn failed_chat_audit_outcome(
             model_id: Some(&context.model_id),
             provider_id: Some(&context.provider_id),
             provider_config: Some(&context.provider_config),
+            developer_role_enabled: developer_role_enabled_for_model(
+                &context.global_config,
+                &context.model_id,
+            ),
             llm_request_retry_count: context.global_config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -8480,6 +8532,10 @@ async fn session_end_hook(
             model_id: Some(&context.model_id),
             provider_id: Some(&context.provider_id),
             provider_config: Some(&context.provider_config),
+            developer_role_enabled: developer_role_enabled_for_model(
+                &context.global_config,
+                &context.model_id,
+            ),
             llm_request_retry_count: context.global_config.app.llm_request_retry_count,
             permission_mode: None,
             payload: json!({

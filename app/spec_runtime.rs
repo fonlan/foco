@@ -837,6 +837,7 @@ async fn run_workspace_spec_job_inner(
         prepared.chat_id.as_deref(),
         &prepared.provider_id,
         &prepared.provider_config,
+        crate::developer_role_enabled_for_model(config, &prepared.request.model_id),
         prepared.request.clone(),
         LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
         WORKSPACE_SPEC_TOOL_NAME,
@@ -916,6 +917,7 @@ async fn run_workspace_spec_update_job_inner(
         job.chat_id.as_deref(),
         &model.provider_id,
         &model.provider_config,
+        crate::developer_role_enabled_for_model(config, &model.model_id),
         request,
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
         WORKSPACE_SPEC_UPDATE_TOOL_NAME,
@@ -1558,6 +1560,7 @@ async fn ensure_workspace_spec_update_markdown_fits_limit(
             let timeout_ms = config.spec.llm_timeout_ms;
             let retry_count = config.app.llm_request_retry_count;
             let save_details = api_audit_save_details(config);
+            let developer_role_enabled = crate::developer_role_enabled_for_model(config, model_id);
             async move {
                 Ok(audited_provider_tool_request(
                     &workspace_path,
@@ -1565,6 +1568,7 @@ async fn ensure_workspace_spec_update_markdown_fits_limit(
                     chat_id.as_deref(),
                     &provider_id,
                     &provider_config,
+                    developer_role_enabled,
                     request,
                     LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
                     WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME,
@@ -1605,6 +1609,7 @@ async fn ensure_workspace_spec_markdown_fits_limit(
             let timeout_ms = config.spec.llm_timeout_ms;
             let retry_count = config.app.llm_request_retry_count;
             let save_details = api_audit_save_details(config);
+            let developer_role_enabled = crate::developer_role_enabled_for_model(config, model_id);
             async move {
                 Ok(audited_provider_tool_request(
                     &workspace_path,
@@ -1612,6 +1617,7 @@ async fn ensure_workspace_spec_markdown_fits_limit(
                     chat_id.as_deref(),
                     &provider_id,
                     &provider_config,
+                    developer_role_enabled,
                     request,
                     LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
                     WORKSPACE_SPEC_TOOL_NAME,

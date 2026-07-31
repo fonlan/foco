@@ -535,6 +535,7 @@ async fn execute_tool_call(
         run_id,
         model_id,
         provider_id,
+        crate::developer_role_enabled_for_model(&global_config, model_id),
         Some(&provider_config),
         llm_request_retry_count,
         &tool_call,
@@ -565,6 +566,7 @@ pub(crate) async fn run_post_tool_hooks(
     run_id: &str,
     model_id: &str,
     provider_id: &str,
+    developer_role_enabled: bool,
     provider_config: Option<&ProviderConnectionConfig>,
     llm_request_retry_count: u32,
     tool_call: &NeutralToolCall,
@@ -590,6 +592,7 @@ pub(crate) async fn run_post_tool_hooks(
             model_id: Some(model_id),
             provider_id: Some(provider_id),
             provider_config,
+            developer_role_enabled,
             llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -875,6 +878,10 @@ async fn execute_tool_unbudgeted(
             model_id: Some(model_id),
             provider_id: Some(provider_id),
             provider_config,
+            developer_role_enabled: crate::developer_role_enabled_for_model(
+                global_config,
+                model_id,
+            ),
             llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -925,6 +932,10 @@ async fn execute_tool_unbudgeted(
                         model_id: Some(model_id),
                         provider_id: Some(provider_id),
                         provider_config,
+                        developer_role_enabled: crate::developer_role_enabled_for_model(
+                            global_config,
+                            model_id,
+                        ),
                         llm_request_retry_count,
                         permission_mode: Some("ask"),
                         payload: json!({
@@ -971,6 +982,10 @@ async fn execute_tool_unbudgeted(
                                 model_id: Some(model_id),
                                 provider_id: Some(provider_id),
                                 provider_config,
+                                developer_role_enabled: crate::developer_role_enabled_for_model(
+                                    global_config,
+                                    model_id,
+                                ),
                                 llm_request_retry_count,
                                 permission_mode: Some("deny"),
                                 payload: json!({
@@ -1024,6 +1039,10 @@ async fn execute_tool_unbudgeted(
                                 model_id: Some(model_id),
                                 provider_id: Some(provider_id),
                                 provider_config,
+                                developer_role_enabled: crate::developer_role_enabled_for_model(
+                                    global_config,
+                                    model_id,
+                                ),
                                 llm_request_retry_count,
                                 permission_mode: Some("deny"),
                                 payload: json!({
@@ -1183,6 +1202,7 @@ async fn execute_tool_unbudgeted(
             run_id,
             model_id,
             provider_id,
+            crate::developer_role_enabled_for_model(global_config, model_id),
             llm_request_retry_count,
             tool_call_id,
             arguments,
@@ -3312,6 +3332,7 @@ async fn execute_ask_question(
     run_id: &str,
     model_id: &str,
     provider_id: &str,
+    developer_role_enabled: bool,
     llm_request_retry_count: u32,
     tool_call_id: &str,
     arguments: Value,
@@ -3359,6 +3380,7 @@ async fn execute_ask_question(
             model_id: Some(model_id),
             provider_id: Some(provider_id),
             provider_config,
+            developer_role_enabled,
             llm_request_retry_count,
             permission_mode: None,
             payload: json!({
@@ -3400,6 +3422,7 @@ async fn execute_ask_question(
                         model_id: Some(model_id),
                         provider_id: Some(provider_id),
                         provider_config,
+                        developer_role_enabled,
                         llm_request_retry_count,
                         permission_mode: None,
                         payload: json!({
@@ -3493,6 +3516,7 @@ async fn execute_ask_question(
             model_id: Some(model_id),
             provider_id: Some(provider_id),
             provider_config,
+            developer_role_enabled,
             llm_request_retry_count,
             permission_mode: None,
             payload: json!({

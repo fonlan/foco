@@ -928,6 +928,10 @@ impl RemoteSidecarRuntimeToolState {
                 model_id: Some(model_id),
                 provider_id: Some(resolved_provider_id.as_str()),
                 provider_config: None,
+                developer_role_enabled: crate::developer_role_enabled_for_model(
+                    &global_config,
+                    model_id,
+                ),
                 llm_request_retry_count: retry_count,
                 permission_mode: None,
                 payload: json!({
@@ -1114,6 +1118,10 @@ impl RemoteSidecarRuntimeToolState {
                 model_id: Some(model_id),
                 provider_id: Some(resolved_provider_id.as_str()),
                 provider_config: None,
+                developer_role_enabled: crate::developer_role_enabled_for_model(
+                    &global_config,
+                    model_id,
+                ),
                 llm_request_retry_count: retry_count,
                 permission_mode: None,
                 payload: json!({
@@ -7891,6 +7899,7 @@ async fn broker_llm_stream(
                     request,
                     foco_providers::ChatRequestRuntimeOptions {
                         latency_mode,
+                        developer_role_enabled: model.developer_role_enabled,
                         temperature,
                     },
                     save_details,
@@ -7918,6 +7927,7 @@ async fn broker_llm_stream(
                 request,
                 foco_providers::ChatRequestRuntimeOptions {
                     latency_mode,
+                    developer_role_enabled: model.developer_role_enabled,
                     temperature,
                 },
                 save_details,
@@ -15819,6 +15829,7 @@ async fn remote_sidecar_execute_tool_call(
         run_id,
         model_id,
         provider_id,
+        crate::developer_role_enabled_for_model(&global_config, model_id),
         None,
         retry_count,
         &tool_call,
@@ -22681,6 +22692,11 @@ async fn remote_sidecar_test_hooks(
             model_id: payload.get("modelId").and_then(Value::as_str),
             provider_id: payload.get("providerId").and_then(Value::as_str),
             provider_config: None,
+            developer_role_enabled: payload
+                .get("modelId")
+                .and_then(Value::as_str)
+                .map(|model_id| crate::developer_role_enabled_for_model(&global_config, model_id))
+                .unwrap_or(true),
             llm_request_retry_count: retry_count,
             permission_mode: None,
             payload: payload.get("payload").cloned().unwrap_or_else(|| json!({})),
@@ -39445,6 +39461,7 @@ mod tests {
             event: "PreCompact".to_string(),
             provider_id: Some("provider-legacy".to_string()),
             provider_config: None,
+            developer_role_enabled: true,
             api_audit_save_details: false,
             timeout_ms: 1_000,
         };
@@ -39518,6 +39535,7 @@ mod tests {
             event: "PreCompact".to_string(),
             provider_id: Some("provider-1".to_string()),
             provider_config: None,
+            developer_role_enabled: true,
             api_audit_save_details: false,
             timeout_ms: 20,
         };

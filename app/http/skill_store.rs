@@ -901,6 +901,7 @@ pub(crate) async fn skill_store_translate(
         None,
         &provider.id,
         &provider_connection_config(provider)?,
+        crate::developer_role_enabled_for_model(&config, &request.model_id),
         request,
         "skill store translation",
         SKILL_TRANSLATION_TOOL_NAME,

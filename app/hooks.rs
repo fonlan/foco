@@ -10,9 +10,9 @@ use std::{
 
 use foco_mcp::{McpRegistry, encode_mcp_tool_name};
 use foco_providers::{
-    NeutralChatMessage, NeutralChatRequest, NeutralChatRole, NeutralChatStream,
-    NeutralChatStreamEvent, NeutralUsage, ProviderConnectionConfig,
-    stream_chat_with_capture_observer,
+    ChatRequestRuntimeOptions, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
+    NeutralChatStream, NeutralChatStreamEvent, NeutralUsage, ProviderConnectionConfig,
+    stream_chat_with_capture_observer_runtime_options,
 };
 #[cfg(test)]
 use foco_store::workspace::WorkspaceDatabase;
@@ -119,6 +119,7 @@ pub(crate) struct PromptHookExecutorRequest {
     pub(crate) event: String,
     pub(crate) provider_id: Option<String>,
     pub(crate) provider_config: Option<ProviderConnectionConfig>,
+    pub(crate) developer_role_enabled: bool,
     pub(crate) api_audit_save_details: bool,
     pub(crate) timeout_ms: u64,
 }
@@ -331,6 +332,7 @@ pub struct HookRunRequest<'a> {
     pub model_id: Option<&'a str>,
     pub provider_id: Option<&'a str>,
     pub provider_config: Option<&'a ProviderConnectionConfig>,
+    pub developer_role_enabled: bool,
     pub llm_request_retry_count: u32,
     pub permission_mode: Option<&'a str>,
     pub payload: Value,
@@ -350,6 +352,7 @@ struct OwnedHookRunRequest {
     model_id: Option<String>,
     provider_id: Option<String>,
     provider_config: Option<ProviderConnectionConfig>,
+    developer_role_enabled: bool,
     llm_request_retry_count: u32,
     permission_mode: Option<String>,
     payload: Value,
@@ -371,6 +374,7 @@ impl<'a> HookRunRequest<'a> {
             model_id: self.model_id.map(str::to_string),
             provider_id: self.provider_id.map(str::to_string),
             provider_config: self.provider_config.cloned(),
+            developer_role_enabled: self.developer_role_enabled,
             llm_request_retry_count: self.llm_request_retry_count,
             permission_mode: self.permission_mode.map(str::to_string),
             payload: self.payload.clone(),
@@ -394,6 +398,7 @@ impl OwnedHookRunRequest {
             model_id: self.model_id.as_deref(),
             provider_id: self.provider_id.as_deref(),
             provider_config: self.provider_config.as_ref(),
+            developer_role_enabled: self.developer_role_enabled,
             llm_request_retry_count: self.llm_request_retry_count,
             permission_mode: self.permission_mode.as_deref(),
             payload: self.payload.clone(),
@@ -811,6 +816,7 @@ async fn run_prompt_hook(
         event: request.event.to_string(),
         provider_id: request.provider_id.map(str::to_string),
         provider_config: request.provider_config.cloned(),
+        developer_role_enabled: request.developer_role_enabled,
         api_audit_save_details: request.api_audit_save_details,
         timeout_ms,
     };
@@ -1171,9 +1177,13 @@ async fn audited_prompt_hook_stream(
     let started_at = std::time::Instant::now();
     match timeout(
         remaining_llm_request_timeout(started_at, request.timeout_ms),
-        stream_chat_with_capture_observer(
+        stream_chat_with_capture_observer_runtime_options(
             provider_config,
             hook_request,
+            ChatRequestRuntimeOptions {
+                developer_role_enabled: request.developer_role_enabled,
+                ..Default::default()
+            },
             request.api_audit_save_details,
             capture.observer(),
             None,
@@ -1671,6 +1681,7 @@ mod tests {
             model_id: Some("model-1"),
             provider_id: Some("provider-1"),
             provider_config: None,
+            developer_role_enabled: true,
             llm_request_retry_count: 2,
             permission_mode: None,
             payload,

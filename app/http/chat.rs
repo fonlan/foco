@@ -1275,6 +1275,7 @@ async fn run_chat_title_generation(input: ChatTitleGenerationInput) -> Result<()
         Some(&input.chat_id),
         &provider_id,
         &provider_config,
+        crate::developer_role_enabled_for_model(&config, &model_id),
         request,
         CHAT_TITLE_GENERATION_REQUEST_KIND,
         LLM_REQUEST_TIMEOUT_MS,

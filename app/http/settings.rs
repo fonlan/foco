@@ -2698,6 +2698,7 @@ pub(crate) async fn test_model(
         None,
         &probe.provider_id,
         &probe.provider_config,
+        crate::developer_role_enabled_for_model(&config, &probe.model_id),
         probe.request,
         execution.request_kind,
         execution.timeout_ms,

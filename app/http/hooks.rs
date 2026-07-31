@@ -187,6 +187,10 @@ pub(crate) async fn test_hooks(
             model_id: provider.as_ref().map(|provider| provider.0.as_str()),
             provider_id: provider.as_ref().map(|provider| provider.1.as_str()),
             provider_config: provider.as_ref().map(|provider| &provider.2),
+            developer_role_enabled: provider
+                .as_ref()
+                .map(|provider| crate::developer_role_enabled_for_model(&config, &provider.0))
+                .unwrap_or(true),
             llm_request_retry_count: config.app.llm_request_retry_count,
             permission_mode: None,
             payload: request.payload.unwrap_or_else(|| json!({})),
