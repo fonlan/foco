@@ -1045,6 +1045,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Select model": "选择模型",
     "Select provider": "选择供应商",
     "Allowed tools": "允许的工具",
+    "Currently unavailable": "当前不可用",
     "{count} selected": "已选择 {count} 项",
     "No tools available": "暂无可用工具",
     "Agent role prompt": "智能体角色提示词",

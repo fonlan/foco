@@ -4804,6 +4804,124 @@ async fn agent_definition_api_manages_revision_validates_tools_and_hides_secrets
             .any(|definition| definition.id == default_definition_id)
     );
 }
+
+#[tokio::test]
+async fn agent_definitions_api_preserves_tools_from_disabled_mcp_servers() {
+    let mcp_tool_name = "mcp__docs__search";
+    let definition_id =
+        AgentDefinitionId::new("agent-definition-disabled-mcp").expect("definition id");
+    let fixture = prompt_state_fixture(|config| {
+        config.mcp.servers.push(McpServerConfig {
+            id: "docs".to_string(),
+            name: "Docs".to_string(),
+            enabled: false,
+            transport: "stdio".to_string(),
+            command: Some("test-mcp-server".to_string()),
+            args: Vec::new(),
+            url: None,
+            execution_host: Default::default(),
+        });
+        config.agent_definitions.push(AgentDefinitionSettings {
+            id: definition_id.clone(),
+            revision: AGENT_DEFINITION_INITIAL_REVISION,
+            name: "Disabled MCP agent".to_string(),
+            description: "Keeps its MCP permission while the server is disabled.".to_string(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions {
+                thinking_level: None,
+                max_output_tokens: None,
+            },
+            system_prompt: "Use the available tools.".to_string(),
+            allowed_tools: vec![mcp_tool_name.to_string()],
+            max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        });
+    });
+    let state = fixture.state.clone();
+
+    let listed = crate::http::settings::agent_definitions(State(state.clone()))
+        .await
+        .expect("list agent definitions despite disabled MCP server")
+        .0;
+    let definition = listed
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == definition_id)
+        .expect("disabled MCP definition remains listed");
+    assert_eq!(definition.allowed_tools, vec![mcp_tool_name.to_string()]);
+
+    let mut new_definition = test_agent_definition_input();
+    new_definition.allowed_tools = vec!["mcp__docs__new_tool".to_string()];
+    let create_error = match crate::http::settings::create_agent_definition(
+        State(state.clone()),
+        Json(CreateAgentDefinitionRequest {
+            definition: new_definition,
+        }),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("new tools from a disabled MCP server should fail"),
+    };
+    assert_eq!(create_error.status, StatusCode::BAD_REQUEST);
+    assert!(create_error.message.contains("unknown runtime tool"));
+
+    let mut definition_input = AgentDefinitionInput {
+        name: "Disabled MCP agent".to_string(),
+        description: "The definition remains editable while MCP is disabled.".to_string(),
+        _provider_id: None,
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions {
+            thinking_level: None,
+            max_output_tokens: None,
+        },
+        system_prompt: "Use the available tools.".to_string(),
+        allowed_tools: vec![mcp_tool_name.to_string()],
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    };
+    let mut replacement_tool_input = definition_input.clone();
+    replacement_tool_input.allowed_tools = vec!["mcp__docs__other_tool".to_string()];
+    let replacement_error = match crate::http::settings::update_agent_definition(
+        State(state.clone()),
+        Json(UpdateAgentDefinitionRequest {
+            id: definition_id.clone(),
+            definition: replacement_tool_input,
+        }),
+    )
+    .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("replacing an existing tool with a disabled MCP tool should fail"),
+    };
+    assert_eq!(replacement_error.status, StatusCode::BAD_REQUEST);
+    assert!(replacement_error.message.contains("unknown runtime tool"));
+
+    let updated = crate::http::settings::update_agent_definition(
+        State(state),
+        Json(UpdateAgentDefinitionRequest {
+            id: definition_id,
+            definition: definition_input,
+        }),
+    )
+    .await
+    .expect("update definition with disabled MCP tool")
+    .0;
+
+    let updated_definition = updated
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.name == "Disabled MCP agent")
+        .expect("updated disabled MCP definition");
+    assert_eq!(
+        updated_definition.description,
+        "The definition remains editable while MCP is disabled."
+    );
+}
+
 #[tokio::test]
 async fn agent_definition_save_rejects_unsupported_thinking_level_for_model() {
     let metadata_key = foco_store::model_metadata::model_metadata_key("provider", "model");

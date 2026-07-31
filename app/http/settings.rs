@@ -11,6 +11,7 @@ use axum::{
 };
 use fancy_regex::Regex;
 use foco_agent::build_default_system_prompt;
+use foco_mcp::decode_mcp_tool_name;
 use foco_providers::{
     NeutralChatRequest, NeutralChatRole, ProviderConfigError, ProviderConnectionConfig,
     ProviderModelRedirect, WebSearchMode, ensure_proxy_compatible_with_kind,
@@ -877,7 +878,7 @@ async fn ensure_default_agent_definition(state: &AppState) -> Result<GlobalConfi
     }
 
     if changed {
-        validate_agent_definition_update(state, &config).await?;
+        validate_agent_definition_update(state, &config, &config.original).await?;
         save_config(state, &mut config)?;
     }
     Ok(config.into_config())
@@ -1252,7 +1253,7 @@ pub(crate) async fn create_agent_definition(
     )?;
     config.agent_definitions.push(definition);
     refresh_builtin_agent_definitions(&state, &mut config).await?;
-    validate_agent_definition_update(&state, &config).await?;
+    validate_agent_definition_update(&state, &config, &config.original).await?;
     save_config(&state, &mut config)?;
 
     Ok(agent_definitions_response(&config))
@@ -1287,7 +1288,7 @@ pub(crate) async fn update_agent_definition(
         ));
     }
     refresh_builtin_agent_definitions(&state, &mut config).await?;
-    validate_agent_definition_update(&state, &config).await?;
+    validate_agent_definition_update(&state, &config, &config.original).await?;
     save_config(&state, &mut config)?;
 
     Ok(agent_definitions_response(&config))
@@ -1341,7 +1342,7 @@ pub(crate) async fn delete_agent_definition(
         }
     }
     refresh_builtin_agent_definitions(&state, &mut config).await?;
-    validate_agent_definition_update(&state, &config).await?;
+    validate_agent_definition_update(&state, &config, &config.original).await?;
     save_config(&state, &mut config)?;
 
     Ok(agent_definitions_response(&config))
@@ -1380,18 +1381,60 @@ fn agent_definition_from_input(
 async fn validate_agent_definition_update(
     state: &AppState,
     config: &GlobalConfig,
+    previous_config: &GlobalConfig,
 ) -> Result<(), ApiError> {
     config
         .validate(Some(&state.config_file))
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     validate_agent_definition_thinking_levels(&state.model_metadata_file, config)?;
-    let known_tools = known_agent_tool_names(state, config).await;
+    let mut known_tools = known_agent_tool_names(state, config).await;
+    known_tools.extend(preserved_disabled_mcp_tool_references(
+        config,
+        previous_config,
+    ));
     validate_agent_definition_tool_references(
         Some(&state.config_file),
         &config.agent_definitions,
         &known_tools,
     )
     .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
+fn preserved_disabled_mcp_tool_references(
+    config: &GlobalConfig,
+    previous_config: &GlobalConfig,
+) -> HashSet<String> {
+    let disabled_server_ids = config
+        .mcp
+        .servers
+        .iter()
+        .filter(|server| !server.enabled)
+        .map(|server| server.id.as_str())
+        .collect::<HashSet<_>>();
+
+    config
+        .agent_definitions
+        .iter()
+        .filter_map(|definition| {
+            previous_config
+                .agent_definitions
+                .iter()
+                .find(|previous| previous.id == definition.id)
+                .map(|previous| (definition, previous))
+        })
+        .flat_map(|(definition, previous)| {
+            definition
+                .allowed_tools
+                .iter()
+                .filter(|tool_name| previous.allowed_tools.contains(*tool_name))
+                .filter_map(|tool_name| {
+                    let (server_id, _) = decode_mcp_tool_name(tool_name).ok()?;
+                    disabled_server_ids
+                        .contains(server_id.as_str())
+                        .then(|| tool_name.clone())
+                })
+        })
+        .collect()
 }
 fn validate_agent_definition_thinking_levels(
     model_metadata_file: &std::path::Path,

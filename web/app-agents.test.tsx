@@ -408,6 +408,47 @@ describe("app agents verification surfaces", () => {
     expect(within(dialog).getByText("1 selected")).toBeInTheDocument();
   });
 
+  it("keeps unavailable selected agent tools visible while editing", async () => {
+    const unavailableTool = "mcp__docs__search";
+    const definitionsWithUnavailableTool = {
+      ...agentDefinitionFixtures,
+      agentDefinitions: agentDefinitionFixtures.agentDefinitions.map((definition) =>
+        definition.name === "Coordinator"
+          ? { ...definition, allowedTools: [unavailableTool] }
+          : definition,
+      ),
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/settings") {
+          return jsonResponse(settings);
+        }
+        if (path === "/api/agent-definitions") {
+          return jsonResponse(definitionsWithUnavailableTool);
+        }
+        return mockFetch(input, init);
+      }),
+    );
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Agents" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit agent Coordinator" }));
+
+    const dialog = screen.getByRole("dialog", { name: "Edit agent" });
+    await userEvent.click(within(dialog).getByText("Allowed tools"));
+    expect(
+      within(dialog).getByRole("switch", { name: new RegExp(`^${unavailableTool}`) }),
+    ).toBeChecked();
+    expect(within(dialog).getByText("Currently unavailable")).toBeInTheDocument();
+  });
+
   it("hides built-in agent deletion and restores its default role prompt", async () => {
     stubDefaultAgentComposerDefaults();
     renderApp();

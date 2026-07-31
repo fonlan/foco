@@ -120,6 +120,7 @@ export function AgentsSettingsPanel({
     () => [...new Set([...agentTools, ...draft.allowedTools])].sort(),
     [agentTools, draft.allowedTools],
   );
+  const availableTools = useMemo(() => new Set(agentTools), [agentTools]);
   const defaultRolePrompt =
     editingDefinition && isBuiltinAgentDefinition(editingDefinition.id)
       ? defaultRolePrompts[editingDefinition.id]
@@ -483,6 +484,9 @@ export function AgentsSettingsPanel({
                       {selectableTools.map((tool) => (
                         <AgentCheckbox
                           checked={draft.allowedTools.includes(tool)}
+                          description={
+                            availableTools.has(tool) ? undefined : t("Currently unavailable")
+                          }
                           key={tool}
                           label={tool}
                           onChange={(checked) => toggleAllowedTool(tool, checked)}
