@@ -4104,7 +4104,8 @@ describe("app-settings verification surfaces", () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
     await userEvent.click(screen.getByRole("button", { name: "Add model" }));
 
     expect(
@@ -4131,7 +4132,8 @@ describe("app-settings verification surfaces", () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
 
     expect(await screen.findByText("GPT Test")).toBeInTheDocument();
     expect(screen.getByText("system prompt Default")).toBeInTheDocument();
@@ -4230,15 +4232,21 @@ describe("app-settings verification surfaces", () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Providers" }));
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
     await userEvent.click(
       await screen.findByRole("button", { name: "Load provider models for OpenAI" }),
     );
     await screen.findByText("o3");
 
-    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
     await userEvent.click(screen.getByRole("button", { name: "Add model" }));
     await userEvent.selectOptions(screen.getByLabelText("Model developer"), "openai");
+    const developerRoleCompatibility = screen.getByRole("switch", {
+      name: "Keep Developer role",
+    });
+    expect(developerRoleCompatibility).toBeChecked();
+    await userEvent.click(developerRoleCompatibility);
     const modelIdSelect = screen.getByLabelText("Model id");
     await userEvent.click(modelIdSelect);
     expect(screen.getByRole("option", { name: "o3" })).toBeInTheDocument();
@@ -4251,13 +4259,14 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByLabelText("Display name")).toHaveValue("o3");
     expect(screen.getByLabelText("Context window")).toHaveValue("200000");
     const inputTypes = screen.getByRole("group", { name: "Input types" });
-    expect(within(inputTypes).getByRole("checkbox", { name: "image" })).toBeChecked();
+    expect(within(inputTypes).getByRole("switch", { name: "image" })).toBeChecked();
     await expectSelectedOption(screen.getByLabelText("Thinking level"), "low");
     expect(screen.getByText("openai/o3")).toBeInTheDocument();
     expect(screen.getByText("$2")).toBeInTheDocument();
-    expect(screen.getByRole("checkbox", { name: "OpenAI" })).toBeChecked();
-    expect(screen.getByRole("checkbox", { name: "Anthropic" })).toBeDisabled();
+    expect(screen.getByRole("switch", { name: "OpenAI" })).toBeChecked();
+    expect(screen.getByRole("switch", { name: "Anthropic" })).toBeDisabled();
     expect(screen.getByText("Model not supported")).toBeInTheDocument();
+    expect(developerRoleCompatibility).not.toBeChecked();
 
     await userEvent.click(screen.getByRole("button", { name: "Save model" }));
 
@@ -4273,7 +4282,59 @@ describe("app-settings verification surfaces", () => {
         modelId: "o3",
         providerIds: ["openai"],
         activeProviderId: "openai",
+        developerRoleEnabled: false,
         thinkingLevel: "low",
+      });
+    });
+  });
+  it("defaults Developer role compatibility for legacy model summaries", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit model GPT Test" }));
+
+    expect(screen.getByText("Developer role compatibility")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "When disabled, Developer messages are sent as System messages to providers.",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("switch", { name: "Keep Developer role" })).toBeChecked();
+  });
+
+  it("rehydrates and saves an explicit Developer role compatibility choice", async () => {
+    const fetchMock = vi.mocked(fetch);
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        {
+          ...settings.configuredModels[0],
+          developerRoleEnabled: false,
+        },
+      ],
+    };
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit model GPT Test" }));
+
+    const developerRoleCompatibility = screen.getByRole("switch", {
+      name: "Keep Developer role",
+    });
+    expect(developerRoleCompatibility).not.toBeChecked();
+    await userEvent.click(developerRoleCompatibility);
+    await userEvent.click(screen.getByRole("button", { name: "Save model" }));
+
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(([url]) => url === "/api/models/manual");
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(saveCall![1]?.body as string)).toMatchObject({
+        developerRoleEnabled: true,
+        modelId: "gpt-test",
       });
     });
   });
@@ -4470,11 +4531,21 @@ describe("app-settings verification surfaces", () => {
 
   it("toggles configured models from the model list", async () => {
     const fetchMock = vi.mocked(fetch);
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        {
+          ...settings.configuredModels[0],
+          developerRoleEnabled: false,
+        },
+      ],
+    };
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Models" }));
-    await userEvent.click(screen.getByRole("checkbox", { name: "Disable model GPT Test" }));
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
+    await userEvent.click(screen.getByRole("switch", { name: "Disable model GPT Test" }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -4488,7 +4559,7 @@ describe("app-settings verification surfaces", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/api/models/manual",
       expect.objectContaining({
-        body: expect.stringContaining('"modelId":"gpt-test"'),
+        body: expect.stringContaining('"developerRoleEnabled":false'),
         method: "POST",
       }),
     );

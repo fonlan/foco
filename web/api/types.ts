@@ -1351,6 +1351,8 @@ export type UpdateModelFastModeResponse = {
 
 export type ModelFormState = {
   displayName: string;
+  /** Whether provider requests retain the Developer role for this model. */
+  developerRoleEnabled: boolean;
   enabled: boolean;
   maxOutputTokens: string;
   modelId: string;

@@ -1791,6 +1791,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Select model id": "选择模型 ID",
     "Model developer": "模型开发者",
     "Select model developer": "选择模型开发者",
+    "Developer role compatibility": "Developer 角色兼容",
+    "Keep Developer role": "保留 Developer 角色",
+    "When disabled, Developer messages are sent as System messages to providers.":
+      "关闭后，Developer 消息会作为 System 消息发送给供应商。",
     "No cached models for developer": "该开发者暂无缓存模型",
     "Model metadata": "模型元数据",
     Reasoning: "推理",

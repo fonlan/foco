@@ -2009,6 +2009,7 @@ export function SettingsPanel({
     );
     setForm({
       displayName: model.displayName,
+      developerRoleEnabled: model.developerRoleEnabled ?? true,
       enabled: model.enabled,
       modelId: model.id,
       contextWindow: numberInputValue(model.contextWindow),
@@ -3676,6 +3677,7 @@ export function SettingsPanel({
         {
           body: JSON.stringify({
             displayName: form.displayName,
+            developerRoleEnabled: form.developerRoleEnabled,
             enabled: form.enabled,
             metadataKey: selectedMetadataKey || null,
             modelId: form.modelId,
@@ -3731,6 +3733,7 @@ export function SettingsPanel({
       const data = await requestJson<ModelMetadataResponse>("/api/models/manual", {
         body: JSON.stringify({
           displayName: model.displayName,
+          developerRoleEnabled: model.developerRoleEnabled ?? true,
           enabled,
           metadataKey: model.metadataKey,
           modelId: model.id,
@@ -12550,6 +12553,36 @@ export function SettingsPanel({
                           ) : null}
                         </label>
 
+                        <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="text-xs font-semibold text-[var(--muted)]">
+                                {t("Developer role compatibility")}
+                              </div>
+                              <p
+                                className="mt-1 text-xs leading-5 text-[var(--muted)]"
+                                id="developer-role-compatibility-help"
+                              >
+                                {t(
+                                  "When disabled, Developer messages are sent as System messages to providers.",
+                                )}
+                              </p>
+                            </div>
+                            <SettingsInput
+                              aria-describedby="developer-role-compatibility-help"
+                              aria-label={t("Keep Developer role")}
+                              checked={form.developerRoleEnabled}
+                              onChange={(event) =>
+                                setForm((current) => ({
+                                  ...current,
+                                  developerRoleEnabled: event.target.checked,
+                                }))
+                              }
+                              type="checkbox"
+                            />
+                          </div>
+                        </div>
+
                         <label className="block">
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("System prompt")}
@@ -13940,6 +13973,7 @@ function Warnings({ warnings }: { warnings: string[] }) {
 function emptyModelForm(): ModelFormState {
   return {
     displayName: "",
+    developerRoleEnabled: true,
     enabled: false,
     maxOutputTokens: "",
     modelId: "",
