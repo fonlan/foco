@@ -76,6 +76,40 @@ describe("durable Complete final text", () => {
     ]);
   });
 
+  it("keeps a replayed tool-only completion fallback unique behind structural parts", () => {
+    const parts: ChatMessagePart[] = [
+      { text: "Before tool. ", type: "text" },
+      toolPart,
+      {
+        type: "agentTaskLifecycle",
+        lifecycle: {
+          completedAt: "2026-08-01T03:00:01Z",
+          durationMs: 1000,
+          errorPreview: null,
+          eventId: "lifecycle-1",
+          instanceId: "agent-1",
+          parentTaskId: "parent-1",
+          resultJson: null,
+          resultPreview: "Completed.",
+          startedAt: "2026-08-01T03:00:00Z",
+          status: "completed",
+          taskId: "task-1",
+          teamId: "team-1",
+        },
+      },
+    ];
+    const event = completeEvent("Tool calls completed.", false);
+    const completedOnce = finalizedTextParts(parts, "Before tool. ", event);
+
+    expect(completedOnce).toEqual([
+      ...parts,
+      { text: "Tool calls completed.", type: "text" },
+    ]);
+    expect(
+      finalizedTextParts(completedOnce, "Before tool. Tool calls completed.", event),
+    ).toEqual(completedOnce);
+  });
+
   it("uses the explicit final segment instead of duplicating accumulated tool-turn text", () => {
     const parts: ChatMessagePart[] = [
       { text: "Before tool. ", type: "text" },

@@ -18013,15 +18013,18 @@ export function finalizedTextParts(
     if (!streamEvent.finalTextSegment) {
       return parts;
     }
-    return streamEvent.hasFinalTextSegment
-      ? replaceLastTextPart(parts, streamEvent.finalTextSegment)
-      : appendTextPart(parts, streamEvent.finalTextSegment);
+    // `finalTextSegment` is itself the original explicit contract. A few
+    // older producers omitted its companion boolean, but that does not turn a
+    // known provider segment into a tool-only fallback.
+    return streamEvent.hasFinalTextSegment === false
+      ? appendOrReplaceToolOnlyFinalFallback(parts, streamEvent.finalTextSegment)
+      : replaceLastTextPart(parts, streamEvent.finalTextSegment);
   }
   if (streamEvent.hasFinalTextSegment === true) {
     return replaceLastTextPart(parts, streamEvent.text);
   }
   if (streamEvent.hasFinalTextSegment === false) {
-    return appendTextPart(parts, streamEvent.text);
+    return appendOrReplaceToolOnlyFinalFallback(parts, streamEvent.text);
   }
 
   const textDelta = missingFinalSuffix(currentContent, streamEvent.text);
@@ -18535,6 +18538,42 @@ function appendTextPart(
       text: lastPart.text + text,
     },
   ];
+}
+
+/**
+ * A tool-only Complete describes a fallback after the provider's final tool
+ * boundary. A replay is allowed to confirm that same fallback, but must not
+ * use an earlier ordinary text part as proof: the model may intentionally use
+ * the same text in a different provider turn.
+ */
+function appendOrReplaceToolOnlyFinalFallback(
+  parts: ChatMessagePart[],
+  text: string,
+): ChatMessagePart[] {
+  if (!text) {
+    return parts;
+  }
+
+  let lastToolCallIndex = -1;
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    if (parts[index]?.type === "toolCall") {
+      lastToolCallIndex = index;
+      break;
+    }
+  }
+  if (lastToolCallIndex < 0) {
+    return appendTextPart(parts, text);
+  }
+
+  for (let index = parts.length - 1; index > lastToolCallIndex; index -= 1) {
+    const part = parts[index];
+    if (part?.type === "text") {
+      return part.text === text
+        ? parts
+        : [...parts.slice(0, index), { ...part, text }, ...parts.slice(index + 1)];
+    }
+  }
+  return [...parts, { type: "text", text }];
 }
 
 function replaceLastTextPart(

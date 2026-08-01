@@ -11879,7 +11879,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
             id: "assistant-1",
             chat_id: "chat-1",
             role: "assistant",
-            content: "Before.After.",
+            content: "Before.Final.",
             sequence: 0,
             metadata_json: Some(
                 r#"{"reasoning":"Think one.Think two.","parts":[{"type":"reasoning","text":"Think one.Think two."},{"type":"toolCall","tool_call_id":"tool-1"},{"type":"text","text":"Before.After."}],"partsVersion":3,"partsSource":"run_events"}"#,
@@ -11950,7 +11950,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
         (
             4,
             "text_delta",
-            json!({ "assistant_message_id": "assistant-1", "delta": "After." }),
+            json!({ "assistant_message_id": "assistant-1", "delta": "Draft." }),
         ),
         (
             6,
@@ -11994,6 +11994,15 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
                     "providerId": "",
                     "modelId": ""
                 }
+            }),
+        ),
+        (
+            8,
+            "completion",
+            json!({
+                "assistant_message_id": "assistant-1",
+                "hasFinalTextSegment": true,
+                "finalTextSegment": "Final.",
             }),
         ),
     ] {
@@ -12047,7 +12056,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
     assert!(
         matches!(&summary.parts[3], ChatMessagePart::Reasoning { text, .. } if text == "Think two.")
     );
-    assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "After."));
+    assert!(matches!(&summary.parts[4], ChatMessagePart::Text { text } if text == "Final."));
     assert!(
         matches!(&summary.parts[5], ChatMessagePart::ContextCompression { kind, detail, .. }
             if kind == "llm"
@@ -12067,7 +12076,11 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
         .expect("saved message read")
         .expect("saved message");
     assert!(saved.metadata_json.contains(r#""tool_call_id":"tool-1""#));
-    assert!(saved.metadata_json.contains(r#""partsVersion":6"#));
+    assert!(
+        saved
+            .metadata_json
+            .contains(&format!(r#""partsVersion":{STORED_CHAT_PARTS_VERSION}"#))
+    );
     assert!(
         saved
             .metadata_json

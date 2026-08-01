@@ -12753,9 +12753,17 @@ fn materialize_missing_assistant_parts(
         .collect::<HashMap<_, _>>();
     let mut parts_by_message = HashMap::<String, Vec<ChatMessagePart>>::new();
     let mut seen_tool_call_ids_by_message = HashMap::<String, HashSet<String>>::new();
-    let mut stream_attempt_snapshots_by_message =
-        HashMap::<String, (Vec<ChatMessagePart>, HashSet<String>, Option<String>)>::new();
+    let mut stream_attempt_snapshots_by_message = HashMap::<
+        String,
+        (
+            Vec<ChatMessagePart>,
+            HashSet<String>,
+            Option<String>,
+            Option<usize>,
+        ),
+    >::new();
     let mut reasoning_started_at_by_message = HashMap::<String, String>::new();
+    let mut final_provider_text_part_indices_by_message = HashMap::<String, Option<usize>>::new();
     let mut run_ids_by_message = HashMap::<String, HashSet<String>>::new();
     for event in &events {
         let value = parse_json_value(&event.payload_json, "chat run event")?;
@@ -12785,10 +12793,12 @@ fn materialize_missing_assistant_parts(
                     );
                 }
                 if let Some(delta) = string_json_field(&value, "delta", "delta") {
-                    push_text_part(
-                        parts_by_message.entry(message_id.to_string()).or_default(),
-                        delta,
-                    );
+                    let parts = parts_by_message.entry(message_id.to_string()).or_default();
+                    push_text_part(parts, delta);
+                    if !delta.is_empty() {
+                        final_provider_text_part_indices_by_message
+                            .insert(message_id.to_string(), parts.len().checked_sub(1));
+                    }
                 }
             }
             "reasoning_delta" => {
@@ -12810,6 +12820,7 @@ fn materialize_missing_assistant_parts(
                         &event.created_at,
                     );
                 }
+                final_provider_text_part_indices_by_message.insert(message_id.to_string(), None);
                 let Some(tool_call) = value.get("toolCall").or_else(|| value.get("tool_call"))
                 else {
                     continue;
@@ -12840,6 +12851,10 @@ fn materialize_missing_assistant_parts(
                             .cloned()
                             .unwrap_or_default(),
                         reasoning_started_at_by_message.get(message_id).cloned(),
+                        final_provider_text_part_indices_by_message
+                            .get(message_id)
+                            .copied()
+                            .flatten(),
                     ),
                 );
             }
@@ -12848,6 +12863,7 @@ fn materialize_missing_assistant_parts(
                     parts_snapshot,
                     seen_tool_call_ids_snapshot,
                     reasoning_started_at_snapshot,
+                    final_provider_text_part_index_snapshot,
                 )) = stream_attempt_snapshots_by_message.get(message_id).cloned()
                 {
                     parts_by_message.insert(message_id.to_string(), parts_snapshot);
@@ -12859,11 +12875,16 @@ fn materialize_missing_assistant_parts(
                     } else {
                         reasoning_started_at_by_message.remove(message_id);
                     }
+                    final_provider_text_part_indices_by_message.insert(
+                        message_id.to_string(),
+                        final_provider_text_part_index_snapshot,
+                    );
                     continue;
                 }
                 parts_by_message.remove(message_id);
                 seen_tool_call_ids_by_message.remove(message_id);
                 reasoning_started_at_by_message.remove(message_id);
+                final_provider_text_part_indices_by_message.insert(message_id.to_string(), None);
                 if let Some(reasoning) =
                     nullable_string_json_field(&value, "reasoning", "reasoning")
                 {
@@ -12873,10 +12894,12 @@ fn materialize_missing_assistant_parts(
                     );
                 }
                 if let Some(text) = string_json_field(&value, "text", "text") {
-                    push_text_part(
-                        parts_by_message.entry(message_id.to_string()).or_default(),
-                        text,
-                    );
+                    let parts = parts_by_message.entry(message_id.to_string()).or_default();
+                    push_text_part(parts, text);
+                    if !text.is_empty() {
+                        final_provider_text_part_indices_by_message
+                            .insert(message_id.to_string(), parts.len().checked_sub(1));
+                    }
                 }
                 if let Some(reset_tool_calls) = value
                     .get("toolCalls")
@@ -12946,6 +12969,30 @@ fn materialize_missing_assistant_parts(
                         .entry(message_id.to_string())
                         .or_default()
                         .push(ChatMessagePart::AgentTaskLifecycle { lifecycle });
+                }
+            }
+            "completion" => {
+                let Some(final_text_segment) = completed_final_text_segment_from_value(&value)
+                else {
+                    continue;
+                };
+                let Some(text) = final_text_segment.text.as_deref() else {
+                    continue;
+                };
+                let parts = parts_by_message.entry(message_id.to_string()).or_default();
+                if final_text_segment.has_final_text_segment {
+                    let final_provider_text_part_index =
+                        final_provider_text_part_indices_by_message
+                            .get(message_id)
+                            .copied()
+                            .flatten();
+                    if replace_final_provider_text_part(parts, final_provider_text_part_index, text)
+                        .is_none()
+                    {
+                        push_text_part(parts, text);
+                    }
+                } else {
+                    append_or_replace_tool_only_final_fallback(parts, text);
                 }
             }
             _ => {}
@@ -14050,9 +14097,17 @@ fn finalized_assistant_message_parts(
         .map(|tool_call| (tool_call.id.as_str(), tool_call))
         .collect::<HashMap<_, _>>();
     let mut seen_tool_call_ids = HashSet::new();
-    let mut stream_attempt_snapshot =
-        None::<(Vec<ChatMessagePart>, HashSet<String>, Option<String>)>;
+    let mut stream_attempt_snapshot = None::<(
+        Vec<ChatMessagePart>,
+        HashSet<String>,
+        Option<String>,
+        Option<usize>,
+    )>;
     let mut reasoning_started_at = None::<String>;
+    // This is the event-derived identity of the provider text that a Complete
+    // event may finalize. Structural parts may arrive after it, so `parts.last`
+    // is not a valid substitute for this boundary.
+    let mut final_provider_text_part_index = None::<usize>;
     let mut parts = Vec::new();
 
     for event in events {
@@ -14090,6 +14145,9 @@ fn finalized_assistant_message_parts(
                 }
                 if let Some(delta) = string_json_field(&value, "delta", "delta") {
                     push_text_part(&mut parts, delta);
+                    if !delta.is_empty() {
+                        final_provider_text_part_index = parts.len().checked_sub(1);
+                    }
                 }
             }
             "reasoning_delta" => {
@@ -14104,6 +14162,10 @@ fn finalized_assistant_message_parts(
                 if let Some(started_at) = reasoning_started_at.take() {
                     finish_reasoning_part_duration(&mut parts, &started_at, &event.event_at);
                 }
+                // The next provider turn begins after this tool boundary. Text
+                // from the preceding turn is not eligible for replacement by
+                // its eventual Complete event.
+                final_provider_text_part_index = None;
                 if let Some(tool_call) = value.get("toolCall").or_else(|| value.get("tool_call"))
                     && let Some(tool_call_id) = string_json_field(tool_call, "id", "callId")
                         .or_else(|| string_json_field(tool_call, "call_id", "callId"))
@@ -14158,6 +14220,7 @@ fn finalized_assistant_message_parts(
                     parts.clone(),
                     seen_tool_call_ids.clone(),
                     reasoning_started_at.clone(),
+                    final_provider_text_part_index,
                 ));
             }
             "stream_reset" => {
@@ -14165,16 +14228,19 @@ fn finalized_assistant_message_parts(
                     parts_snapshot,
                     seen_tool_call_ids_snapshot,
                     reasoning_started_at_snapshot,
+                    final_provider_text_part_index_snapshot,
                 )) = stream_attempt_snapshot.clone()
                 {
                     parts = parts_snapshot;
                     seen_tool_call_ids = seen_tool_call_ids_snapshot;
                     reasoning_started_at = reasoning_started_at_snapshot;
+                    final_provider_text_part_index = final_provider_text_part_index_snapshot;
                     continue;
                 }
                 parts.clear();
                 seen_tool_call_ids.clear();
                 reasoning_started_at = None;
+                final_provider_text_part_index = None;
                 if let Some(reasoning) =
                     nullable_string_json_field(&value, "reasoning", "reasoning")
                 {
@@ -14182,6 +14248,9 @@ fn finalized_assistant_message_parts(
                 }
                 if let Some(text) = string_json_field(&value, "text", "text") {
                     push_text_part(&mut parts, text);
+                    if !text.is_empty() {
+                        final_provider_text_part_index = parts.len().checked_sub(1);
+                    }
                 }
                 if let Some(reset_tool_calls) = value
                     .get("toolCalls")
@@ -14237,22 +14306,11 @@ fn finalized_assistant_message_parts(
         );
     }
     let completed_final_text_segment = completed_final_text_segment(events, assistant_message_id)?;
-    let has_missing_tool_call_parts = tool_calls
-        .iter()
-        .any(|tool_call| !seen_tool_call_ids.contains(&tool_call.id));
-    let final_text_to_append = match completed_final_text_segment.as_ref() {
+    let mut finalized_text_part_index = match completed_final_text_segment.as_ref() {
         Some(CompletedFinalTextSegment {
             has_final_text_segment: true,
             text: Some(text),
-        }) if !has_missing_tool_call_parts
-            && replace_trailing_final_text_part(&mut parts, text, tool_calls) =>
-        {
-            None
-        }
-        Some(CompletedFinalTextSegment {
-            has_final_text_segment: true,
-            text: Some(text),
-        }) => Some(text.as_str()),
+        }) => replace_final_provider_text_part(&mut parts, final_provider_text_part_index, text),
         _ => None,
     };
     if completed_final_text_segment.is_none()
@@ -14266,14 +14324,28 @@ fn finalized_assistant_message_parts(
         push_text_part(&mut parts, assistant_text);
     }
     for tool_call in tool_calls {
-        push_finalized_tool_call_part(
-            &mut parts,
-            &mut seen_tool_call_ids,
-            &tool_calls_by_id,
-            &tool_call.id,
-        );
+        if !seen_tool_call_ids.insert(tool_call.id.clone()) {
+            continue;
+        }
+        let part = ChatMessagePart::ToolCall {
+            tool_call: tool_call.clone(),
+        };
+        if let Some(index) = finalized_text_part_index.as_mut() {
+            // A tool card missing from its audit event has no reliable event
+            // position. Keep the known final provider boundary intact by
+            // materializing that card immediately before it.
+            parts.insert(*index, part);
+            *index += 1;
+        } else {
+            parts.push(part);
+        }
     }
-    if let Some(text) = final_text_to_append {
+    if finalized_text_part_index.is_none()
+        && let Some(CompletedFinalTextSegment {
+            has_final_text_segment: true,
+            text: Some(text),
+        }) = completed_final_text_segment.as_ref()
+    {
         // Some older or interrupted streams can lack a tool_call audit event.
         // The durable completion is nevertheless after every executed tool, so
         // append it only after recovering those missing cards.
@@ -14325,22 +14397,29 @@ fn completed_final_text_segment(
         return Ok(None);
     };
     let value = parse_json_value(&event.normalized_event_json, "chat completion event")?;
+    Ok(completed_final_text_segment_from_value(&value))
+}
+
+fn completed_final_text_segment_from_value(value: &Value) -> Option<CompletedFinalTextSegment> {
     let Some(segment) = value
         .get("finalTextSegment")
         .or_else(|| value.get("final_text_segment"))
     else {
         // Events written before the explicit segment contract retain the
         // conservative legacy replay path.
-        return Ok(None);
+        return None;
     };
-    Ok(Some(CompletedFinalTextSegment {
+    Some(CompletedFinalTextSegment {
         has_final_text_segment: value
             .get("hasFinalTextSegment")
             .or_else(|| value.get("has_final_text_segment"))
             .and_then(Value::as_bool)
-            .unwrap_or(false),
+            // The segment itself is the original explicit contract. Some
+            // early producers omitted the companion boolean, so a string
+            // segment remains a replaceable final provider segment.
+            .unwrap_or_else(|| segment.is_string()),
         text: segment.as_str().map(ToOwned::to_owned),
-    }))
+    })
 }
 
 fn stored_chat_message_parts(
@@ -14418,29 +14497,47 @@ fn push_text_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
     }
 }
 
-fn replace_trailing_final_text_part(
+fn replace_final_provider_text_part(
     parts: &mut [ChatMessagePart],
+    final_provider_text_part_index: Option<usize>,
     text: &str,
-    tool_calls: &[ChatToolCallSummary],
-) -> bool {
+) -> Option<usize> {
     if text.is_empty() {
-        return false;
+        return None;
     }
-    let Some(last_part_index) = parts.len().checked_sub(1) else {
-        return false;
+    let Some(index) = final_provider_text_part_index else {
+        return None;
     };
-    if !tool_calls.is_empty()
-        && !parts[..last_part_index]
-            .iter()
-            .any(|part| matches!(part, ChatMessagePart::ToolCall { .. }))
-    {
-        return false;
-    }
-    let Some(ChatMessagePart::Text { text: existing }) = parts.get_mut(last_part_index) else {
-        return false;
+    let Some(ChatMessagePart::Text { text: existing }) = parts.get_mut(index) else {
+        return None;
     };
     *existing = text.to_string();
-    true
+    Some(index)
+}
+
+fn append_or_replace_tool_only_final_fallback(parts: &mut Vec<ChatMessagePart>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let Some(last_tool_call_index) = parts
+        .iter()
+        .rposition(|part| matches!(part, ChatMessagePart::ToolCall { .. }))
+    else {
+        push_text_part(parts, text);
+        return;
+    };
+    if let Some(ChatMessagePart::Text { text: existing }) = parts
+        .iter_mut()
+        .skip(last_tool_call_index + 1)
+        .rev()
+        .find(|part| matches!(part, ChatMessagePart::Text { .. }))
+    {
+        *existing = text.to_string();
+        return;
+    }
+    parts.push(ChatMessagePart::Text {
+        text: text.to_string(),
+    });
 }
 
 fn timestamp_duration_ms(started_at: &str, ended_at: &str) -> Option<i64> {

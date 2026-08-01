@@ -11168,6 +11168,39 @@ fn remote_append_text_or_reasoning_part(parts: &mut Vec<Value>, part_type: &str,
     }));
 }
 
+fn remote_replace_final_provider_text_part(
+    parts: &mut [Value],
+    final_provider_text_part_index: Option<usize>,
+    text: &str,
+) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let Some(part) = final_provider_text_part_index.and_then(|index| parts.get_mut(index)) else {
+        return false;
+    };
+    if part.get("type").and_then(Value::as_str) != Some("text") {
+        return false;
+    }
+    let Some(object) = part.as_object_mut() else {
+        return false;
+    };
+    object.insert("text".to_string(), Value::String(text.to_string()));
+    true
+}
+
+fn remote_completion_final_text_segment(value: &Value) -> Option<(bool, Option<&str>)> {
+    let segment = value
+        .get("finalTextSegment")
+        .or_else(|| value.get("final_text_segment"))?;
+    let has_final_text_segment = value
+        .get("hasFinalTextSegment")
+        .or_else(|| value.get("has_final_text_segment"))
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| segment.is_string());
+    Some((has_final_text_segment, segment.as_str()))
+}
+
 /// Materialize missing assistant `metadata.parts` from `run_events` (includes
 /// `context_compression`) so history reload can show compression blocks for
 /// older messages that only have events.
@@ -11194,6 +11227,9 @@ fn remote_materialize_missing_assistant_parts(
     let events = database.history_run_events_for_chat_messages(chat_id, &missing_message_ids)?;
     let mut event_parts_by_message = HashMap::<String, Vec<Value>>::new();
     let mut seen_tool_call_ids_by_message = HashMap::<String, HashSet<String>>::new();
+    let mut stream_attempt_snapshots_by_message =
+        HashMap::<String, (Vec<Value>, HashSet<String>, Option<usize>)>::new();
+    let mut final_provider_text_part_indices_by_message = HashMap::<String, Option<usize>>::new();
     let mut had_stream_parts_by_message = HashMap::<String, bool>::new();
     let mut run_ids_by_message = HashMap::<String, HashSet<String>>::new();
 
@@ -11229,13 +11265,14 @@ fn remote_materialize_missing_assistant_parts(
                     *had_stream_parts_by_message
                         .entry(message_id.to_string())
                         .or_default() = true;
-                    remote_append_text_or_reasoning_part(
-                        event_parts_by_message
-                            .entry(message_id.to_string())
-                            .or_default(),
-                        "text",
-                        delta,
-                    );
+                    let parts = event_parts_by_message
+                        .entry(message_id.to_string())
+                        .or_default();
+                    remote_append_text_or_reasoning_part(parts, "text", delta);
+                    if !delta.is_empty() {
+                        final_provider_text_part_indices_by_message
+                            .insert(message_id.to_string(), parts.len().checked_sub(1));
+                    }
                 }
             }
             "reasoning_delta" => {
@@ -11253,6 +11290,7 @@ fn remote_materialize_missing_assistant_parts(
                 }
             }
             "tool_call" => {
+                final_provider_text_part_indices_by_message.insert(message_id.to_string(), None);
                 let Some(tool_call) = value.get("toolCall").or_else(|| value.get("tool_call"))
                 else {
                     continue;
@@ -11287,6 +11325,103 @@ fn remote_materialize_missing_assistant_parts(
                         "type": "toolCall",
                         "toolCall": summary,
                     }));
+            }
+            "stream_attempt_start" => {
+                stream_attempt_snapshots_by_message.insert(
+                    message_id.to_string(),
+                    (
+                        event_parts_by_message
+                            .get(message_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        seen_tool_call_ids_by_message
+                            .get(message_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        final_provider_text_part_indices_by_message
+                            .get(message_id)
+                            .copied()
+                            .flatten(),
+                    ),
+                );
+            }
+            "stream_reset" => {
+                *had_stream_parts_by_message
+                    .entry(message_id.to_string())
+                    .or_default() = true;
+                if let Some((
+                    parts_snapshot,
+                    seen_tool_call_ids_snapshot,
+                    final_provider_text_part_index_snapshot,
+                )) = stream_attempt_snapshots_by_message.get(message_id).cloned()
+                {
+                    event_parts_by_message.insert(message_id.to_string(), parts_snapshot);
+                    seen_tool_call_ids_by_message
+                        .insert(message_id.to_string(), seen_tool_call_ids_snapshot);
+                    final_provider_text_part_indices_by_message.insert(
+                        message_id.to_string(),
+                        final_provider_text_part_index_snapshot,
+                    );
+                    continue;
+                }
+
+                event_parts_by_message.remove(message_id);
+                seen_tool_call_ids_by_message.remove(message_id);
+                final_provider_text_part_indices_by_message.insert(message_id.to_string(), None);
+                if let Some(reasoning) = value.get("reasoning").and_then(Value::as_str) {
+                    remote_append_text_or_reasoning_part(
+                        event_parts_by_message
+                            .entry(message_id.to_string())
+                            .or_default(),
+                        "reasoning",
+                        reasoning,
+                    );
+                }
+                if let Some(text) = value.get("text").and_then(Value::as_str) {
+                    let parts = event_parts_by_message
+                        .entry(message_id.to_string())
+                        .or_default();
+                    remote_append_text_or_reasoning_part(parts, "text", text);
+                    if !text.is_empty() {
+                        final_provider_text_part_indices_by_message
+                            .insert(message_id.to_string(), parts.len().checked_sub(1));
+                    }
+                }
+                if let Some(reset_tool_calls) = value
+                    .get("toolCalls")
+                    .or_else(|| value.get("tool_calls"))
+                    .and_then(Value::as_array)
+                {
+                    for tool_call in reset_tool_calls {
+                        let Some(tool_call_id) = tool_call
+                            .get("id")
+                            .or_else(|| tool_call.get("callId"))
+                            .or_else(|| tool_call.get("call_id"))
+                            .and_then(Value::as_str)
+                        else {
+                            continue;
+                        };
+                        if !seen_tool_call_ids_by_message
+                            .entry(message_id.to_string())
+                            .or_default()
+                            .insert(tool_call_id.to_string())
+                        {
+                            continue;
+                        }
+                        let summary = tool_calls
+                            .iter()
+                            .find(|row| row.id == tool_call_id)
+                            .map(remote_tool_call_summary)
+                            .unwrap_or_else(|| tool_call.clone());
+                        event_parts_by_message
+                            .entry(message_id.to_string())
+                            .or_default()
+                            .push(json!({
+                                "type": "toolCall",
+                                "toolCall": summary,
+                            }));
+                    }
+                }
             }
             "context_compression" => {
                 if let Some(next_part) = remote_context_compression_part_from_event_payload(&value)
@@ -11332,6 +11467,43 @@ fn remote_materialize_missing_assistant_parts(
                     .entry(message_id.to_string())
                     .or_default()
                     .push(part);
+            }
+            "agent_task_lifecycle" => {
+                if let Some(lifecycle) = value.get("lifecycle") {
+                    event_parts_by_message
+                        .entry(message_id.to_string())
+                        .or_default()
+                        .push(json!({
+                            "type": "agentTaskLifecycle",
+                            "lifecycle": lifecycle,
+                        }));
+                }
+            }
+            "completion" => {
+                let Some((has_final_text_segment, Some(text))) =
+                    remote_completion_final_text_segment(&value)
+                else {
+                    continue;
+                };
+                let parts = event_parts_by_message
+                    .entry(message_id.to_string())
+                    .or_default();
+                if has_final_text_segment {
+                    let final_provider_text_part_index =
+                        final_provider_text_part_indices_by_message
+                            .get(message_id)
+                            .copied()
+                            .flatten();
+                    if !remote_replace_final_provider_text_part(
+                        parts,
+                        final_provider_text_part_index,
+                        text,
+                    ) {
+                        remote_append_text_or_reasoning_part(parts, "text", text);
+                    }
+                } else {
+                    remote_append_text_or_reasoning_part(parts, "text", text);
+                }
             }
             _ => {}
         }
@@ -42038,6 +42210,70 @@ mod tests {
             1,
             &payload,
         );
+        for (sequence, event_type, payload) in [
+            (
+                2,
+                "stream_attempt_start",
+                json!({ "assistantMessageId": "assistant-1" }),
+            ),
+            (
+                3,
+                "text_delta",
+                json!({
+                    "assistantMessageId": "assistant-1",
+                    "delta": "discarded retry draft",
+                }),
+            ),
+            (
+                4,
+                "stream_reset",
+                json!({ "assistantMessageId": "assistant-1" }),
+            ),
+            (
+                5,
+                "agent_task_lifecycle",
+                json!({
+                    "assistantMessageId": "assistant-1",
+                    "lifecycle": {
+                        "eventId": "lifecycle-1",
+                        "teamId": "team-1",
+                        "taskId": "task-1",
+                        "parentTaskId": "parent-1",
+                        "instanceId": "agent-1",
+                        "status": "completed",
+                        "completedAt": "2026-07-12T00:00:01Z",
+                    },
+                }),
+            ),
+            (
+                6,
+                "text_delta",
+                json!({
+                    "assistantMessageId": "assistant-1",
+                    "delta": "draft answer",
+                }),
+            ),
+            (
+                7,
+                "completion",
+                json!({
+                    "assistantMessageId": "assistant-1",
+                    "hasFinalTextSegment": true,
+                    "finalTextSegment": "final answer",
+                }),
+            ),
+        ] {
+            database
+                .insert_run_event(NewRunEvent {
+                    id: &format!("remote-run-event-{sequence}"),
+                    chat_id: "chat-1",
+                    run_id: "remote-run-1",
+                    sequence,
+                    event_type,
+                    payload_json: &payload.to_string(),
+                })
+                .expect("run event");
+        }
 
         let tool_calls = database.tool_calls_for_chat("chat-1").expect("tool calls");
         let mut messages = database
@@ -42069,10 +42305,22 @@ mod tests {
                 .iter()
                 .any(|part| part.get("type").and_then(Value::as_str) == Some("contextCompression"))
         );
-        assert!(parts.iter().any(
-            |part| part.get("type").and_then(Value::as_str) == Some("text")
-                && part.get("text").and_then(Value::as_str) == Some("final answer")
-        ));
+        assert_eq!(
+            parts
+                .iter()
+                .filter(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("text")
+                        && part.get("text").and_then(Value::as_str) == Some("final answer")
+                })
+                .count(),
+            1
+        );
+        assert!(
+            parts
+                .iter()
+                .any(|part| part.get("type").and_then(Value::as_str) == Some("agentTaskLifecycle")),
+            "materialized parts: {parts:?}"
+        );
 
         // Second pass must be a no-op (parts already present).
         let before = assistant.metadata_json.clone();

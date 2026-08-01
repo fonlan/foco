@@ -820,9 +820,10 @@ export type ChatStreamEvent =
       assistantMessageId: string;
       text: string;
       /**
-       * Whether `text` belongs to a final provider text segment. When false,
-       * `text` is the durable completion fallback for a tool-only final turn.
-       * Missing on older events keeps the legacy best-effort behavior.
+       * Whether `finalTextSegment` belongs to a final provider text segment.
+       * When false, it is the durable completion fallback for a tool-only
+       * final turn. A string `finalTextSegment` with this field absent remains
+       * an explicit final segment for compatibility with early producers.
        */
       hasFinalTextSegment?: boolean;
       /**

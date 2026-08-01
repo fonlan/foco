@@ -11556,7 +11556,7 @@ impl WorkspaceDatabase {
              FROM run_events
              WHERE chat_id = ?1
                AND event_type IN
-                   ('reasoning_delta', 'text_delta', 'tool_call', 'stream_attempt_start', 'stream_reset', 'context_compression', 'guidance_applied')
+                   ('reasoning_delta', 'text_delta', 'tool_call', 'stream_attempt_start', 'stream_reset', 'context_compression', 'guidance_applied', 'agent_task_lifecycle', 'completion')
                AND (
                    CAST(
                        COALESCE(
