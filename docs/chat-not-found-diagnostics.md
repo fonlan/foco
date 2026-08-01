@@ -17,7 +17,7 @@ event with the following optional structured fields:
 | `operation` | Safe operation name, for example `context.usage` | Yes |
 | `phase` | Safe failure stage, for example `existing-chat-lookup` | Yes |
 | `workspaceId`, `chatId` | Durable routing identifiers | No |
-| `runtimeTopology` | `local` or `ssh-sidecar` | No |
+| `runtimeTopology` | `local` or `remote-sidecar` | No |
 | `databaseIdentity` | `db-sha256:<digest>` of the normalized database path | No |
 | `queuedUserMessageId`, `runId`, `agentTaskId` | Available durable run associations | No |
 
@@ -41,8 +41,10 @@ The HTTP status code and the legacy JSON shape remain compatible:
 Older clients can continue to read `error`; clients talking to an older server
 must treat an absent `diagnostic` object as normal compatibility fallback. The
 same opaque reference is also attached to the response header
-`x-foco-chat-not-found-diagnostic-id`, allowing the HTTP completion event to
-be joined with the `chat_not_found` event without logging normal requests.
+`x-foco-chat-not-found-diagnostic-id`. The safe operation and phase are
+available as `x-foco-chat-not-found-operation` and
+`x-foco-chat-not-found-phase`, allowing an SSH proxy completion event to be
+joined with the sidecar `chat_not_found` event without logging normal requests.
 
 ## Source matrix
 
@@ -54,8 +56,8 @@ be joined with the `chat_not_found` event without logging normal requests.
 | Local edit | `app/http/chat.rs` → `WorkspaceDatabase::rewrite_chat_from_user_message` | `chat.edit` / `rewrite-chat-from-user-message` | workspace, chat, user message, optional Agent task |
 | Local messages, todo, statistics, delete, Agent setup | `app/http/chat.rs`, `app/http/agents.rs` | their named operation / existence, read, or delete phase | workspace and chat |
 | Workspace persistence | `store/workspace.rs` | typed `WorkspaceDatabaseError::ChatNotFound` source from queue mutation, start/claim/clear, rewrite, todo mutation | chat; application caller adds workspace/database and run context |
-| SSH sidecar message/edit/delete/statistics/todo/team | `app/remote_workspace.rs` | Phase 2 will use the same operation names with `runtimeTopology=ssh-sidecar` | workspace, chat; edit includes message; team includes task when available |
-| SSH sidecar queue/stream and context usage | `app/remote_workspace.rs` | Phase 2 will instrument queue/stream preflight and `context.usage` with the same contract | workspace, chat, queued user message, visible assistant/run/task when available |
+| SSH sidecar message/edit/delete/statistics/todo/team | `app/remote_workspace.rs` | same operation names with `runtimeTopology=remote-sidecar` | workspace, chat; edit includes message; team includes task when available |
+| SSH sidecar queue/stream and context usage | `app/remote_workspace.rs` | queue/stream preflight and `context.usage` use the same contract | workspace, chat, queued user message, visible assistant/run/task when available |
 
 The source matrix intentionally excludes successful requests. There is no
 per-request success logging added by this contract.

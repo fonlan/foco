@@ -40685,6 +40685,46 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
     assert_eq!(body["compression"]["runtimeToolStateSnapshotCount"], 1);
     assert_eq!(body["contextUsageTimeline"][0]["contextWindow"], 128_000);
 
+    let missing_statistics_response = reqwest::get(format!(
+        "http://{app_addr}/api/workspaces/remote/chats/missing-chat/statistics"
+    ))
+    .await
+    .expect("proxied missing-chat statistics request");
+    assert_eq!(
+        missing_statistics_response.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        missing_statistics_response
+            .headers()
+            .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_DIAGNOSTIC_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("diagnostic-fixed-for-test")
+    );
+    assert_eq!(
+        missing_statistics_response
+            .headers()
+            .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_OPERATION_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("chat.statistics")
+    );
+    assert_eq!(
+        missing_statistics_response
+            .headers()
+            .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_PHASE_HEADER)
+            .and_then(|value| value.to_str().ok()),
+        Some("existing-chat-lookup")
+    );
+    let missing_statistics_body = missing_statistics_response
+        .text()
+        .await
+        .expect("missing-chat statistics body");
+    assert!(missing_statistics_body.contains("diagnostic-fixed-for-test"));
+    assert!(missing_statistics_body.contains("chat.statistics"));
+    assert!(missing_statistics_body.contains("existing-chat-lookup"));
+    assert!(!missing_statistics_body.contains("missing-chat"));
+    assert!(!missing_statistics_body.contains("sidecar-secret"));
+
     let todo_response = reqwest::get(format!(
         "http://{app_addr}/api/workspaces/remote/chats/chat-1/todo-graph"
     ))
@@ -40936,7 +40976,7 @@ async fn serve_fake_sidecar_proxy_fixture(
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/statistics",
-            axum::routing::get(move |headers: HeaderMap| {
+            axum::routing::get(move |AxumPath(chat_id): AxumPath<String>, headers: HeaderMap| {
                 let expected = expected_chat_stats.clone();
                 let seen = chat_stats_seen.clone();
                 async move {
@@ -40948,6 +40988,34 @@ async fn serve_fake_sidecar_proxy_fixture(
                     seen.lock().expect("seen auth").push(auth.clone());
                     if auth != expected {
                         return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    if chat_id == "missing-chat" {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            [
+                                (
+                                    crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_DIAGNOSTIC_HEADER,
+                                    "diagnostic-fixed-for-test",
+                                ),
+                                (
+                                    crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_OPERATION_HEADER,
+                                    "chat.statistics",
+                                ),
+                                (
+                                    crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_PHASE_HEADER,
+                                    "existing-chat-lookup",
+                                ),
+                            ],
+                            Json(json!({
+                                "error": "chat was not found (diagnostic reference: diagnostic-fixed-for-test)",
+                                "diagnostic": {
+                                    "diagnosticId": "diagnostic-fixed-for-test",
+                                    "operation": "chat.statistics",
+                                    "phase": "existing-chat-lookup"
+                                }
+                            })),
+                        )
+                            .into_response();
                     }
                     Json(json!({
                         "workspaceId": "remote",

@@ -6,6 +6,8 @@ use sha2::{Digest, Sha256};
 use crate::ApiError;
 
 pub(crate) const CHAT_NOT_FOUND_DIAGNOSTIC_HEADER: &str = "x-foco-chat-not-found-diagnostic-id";
+pub(crate) const CHAT_NOT_FOUND_OPERATION_HEADER: &str = "x-foco-chat-not-found-operation";
+pub(crate) const CHAT_NOT_FOUND_PHASE_HEADER: &str = "x-foco-chat-not-found-phase";
 
 /// Server-side correlation fields for a missing-chat failure.
 ///
@@ -52,14 +54,14 @@ pub(crate) struct ChatNotFoundClientDiagnostic {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ChatRuntimeTopology {
     Local,
-    SshSidecar,
+    RemoteSidecar,
 }
 
 impl ChatRuntimeTopology {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Local => "local",
-            Self::SshSidecar => "ssh-sidecar",
+            Self::RemoteSidecar => "remote-sidecar",
         }
     }
 }
@@ -97,7 +99,7 @@ impl ChatNotFoundDiagnosticContext {
         }
     }
 
-    pub(crate) fn ssh_sidecar(
+    pub(crate) fn remote_sidecar(
         operation: &'static str,
         phase: &'static str,
         workspace_id: impl Into<String>,
@@ -107,7 +109,7 @@ impl ChatNotFoundDiagnosticContext {
             operation: Some(operation),
             phase: Some(phase),
             workspace_id: Some(workspace_id.into()),
-            runtime_topology: Some(ChatRuntimeTopology::SshSidecar),
+            runtime_topology: Some(ChatRuntimeTopology::RemoteSidecar),
             database_path: Some(database_path.as_ref().to_path_buf()),
             ..Self::default()
         }
@@ -266,7 +268,7 @@ mod tests {
     #[tokio::test]
     async fn api_error_preserves_legacy_error_and_exposes_only_safe_diagnostic_fields() {
         let response = api_error_for_missing_chat(
-            ChatNotFoundDiagnosticContext::ssh_sidecar(
+            ChatNotFoundDiagnosticContext::remote_sidecar(
                 "context.usage",
                 "existing-chat-lookup",
                 "workspace-1",
@@ -285,6 +287,20 @@ mod tests {
             .and_then(|value| value.to_str().ok())
             .expect("diagnostic response header")
             .to_string();
+        assert_eq!(
+            response
+                .headers()
+                .get(CHAT_NOT_FOUND_OPERATION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("context.usage")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(CHAT_NOT_FOUND_PHASE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("existing-chat-lookup")
+        );
 
         let body = to_bytes(response.into_body(), 4_096)
             .await

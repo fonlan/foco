@@ -8904,6 +8904,10 @@ impl ApiError {
         &self.message
     }
 
+    pub(crate) fn has_chat_not_found_diagnostic(&self) -> bool {
+        self.chat_not_found_diagnostic.is_some()
+    }
+
     pub(crate) fn status(&self) -> StatusCode {
         self.status
     }
@@ -8981,30 +8985,51 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let diagnostic_id = self
-            .chat_not_found_diagnostic
-            .as_ref()
-            .map(|diagnostic| diagnostic.diagnostic_id.clone());
+        let diagnostic = self.chat_not_found_diagnostic;
         let mut response = (
             self.status,
             Json(ErrorResponse {
                 error: self.message,
-                diagnostic: self.chat_not_found_diagnostic,
+                diagnostic: diagnostic.clone(),
             }),
         )
             .into_response();
-        if let Some(diagnostic_id) = diagnostic_id
-            && let Ok(header_value) = HeaderValue::from_bytes(diagnostic_id.as_bytes())
-        {
-            response.headers_mut().insert(
-                header::HeaderName::from_static(
-                    crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_DIAGNOSTIC_HEADER,
-                ),
-                header_value,
+        if let Some(diagnostic) = diagnostic {
+            insert_chat_not_found_diagnostic_header(
+                &mut response,
+                crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_DIAGNOSTIC_HEADER,
+                &diagnostic.diagnostic_id,
             );
+            if let Some(operation) = diagnostic.operation.as_deref() {
+                insert_chat_not_found_diagnostic_header(
+                    &mut response,
+                    crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_OPERATION_HEADER,
+                    operation,
+                );
+            }
+            if let Some(phase) = diagnostic.phase.as_deref() {
+                insert_chat_not_found_diagnostic_header(
+                    &mut response,
+                    crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_PHASE_HEADER,
+                    phase,
+                );
+            }
         }
         response
     }
+}
+
+fn insert_chat_not_found_diagnostic_header(
+    response: &mut Response,
+    name: &'static str,
+    value: &str,
+) {
+    let Ok(header_value) = HeaderValue::from_bytes(value.as_bytes()) else {
+        return;
+    };
+    response
+        .headers_mut()
+        .insert(header::HeaderName::from_static(name), header_value);
 }
 
 fn validate_workspace_request(

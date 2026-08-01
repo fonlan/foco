@@ -10494,6 +10494,44 @@ fn sidecar_workspace_database(
         .map_err(|e| ApiError::from_workspace_error(e).into_response())
 }
 
+fn remote_sidecar_missing_chat_error(
+    state: &RemoteSidecarState,
+    database: &WorkspaceDatabase,
+    operation: &'static str,
+    phase: &'static str,
+    chat_id: impl Into<String>,
+) -> ApiError {
+    crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+        crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::remote_sidecar(
+            operation,
+            phase,
+            &state.workspace_id,
+            database.database_path(),
+        )
+        .with_chat_id(chat_id),
+    )
+}
+
+fn remote_sidecar_workspace_error_with_chat_not_found_context(
+    state: &RemoteSidecarState,
+    database: &WorkspaceDatabase,
+    operation: &'static str,
+    phase: &'static str,
+    chat_id: impl Into<String>,
+    error: WorkspaceDatabaseError,
+) -> ApiError {
+    crate::ApiError::from_workspace_error_with_chat_not_found_context(
+        error,
+        crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::remote_sidecar(
+            operation,
+            phase,
+            &state.workspace_id,
+            database.database_path(),
+        )
+        .with_chat_id(chat_id),
+    )
+}
+
 /// Open the ordinary workspace gate only for one synchronous persistence section.
 /// Callers must pass data snapshots rather than a handle into async broker, tool, or Git work.
 fn with_sidecar_workspace_database<T>(
@@ -11716,9 +11754,26 @@ async fn remote_sidecar_chat_messages(
     }
     let chat = database
         .chat(&chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .map_err(|error| {
+            remote_sidecar_workspace_error_with_chat_not_found_context(
+                &state,
+                &database,
+                "chat.messages",
+                "existing-chat-lookup",
+                chat_id.clone(),
+                error,
+            )
+            .into_response()
+        })?
         .ok_or_else(|| {
-            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response()
+            remote_sidecar_missing_chat_error(
+                &state,
+                &database,
+                "chat.messages",
+                "existing-chat-lookup",
+                chat_id.clone(),
+            )
+            .into_response()
         })?;
     let fetch_limit = limit.saturating_add(1);
     let mut messages = database
@@ -11897,13 +11952,25 @@ async fn remote_sidecar_delete_chat(
     remote_sidecar_clear_chat_run_streams(&state, &chat_id);
 
     let mut database = sidecar_workspace_database(&state)?;
-    if !database
-        .delete_chat(&chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
-    {
-        return Err(
-            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response(),
-        );
+    if !database.delete_chat(&chat_id).map_err(|error| {
+        remote_sidecar_workspace_error_with_chat_not_found_context(
+            &state,
+            &database,
+            "chat.delete",
+            "delete-chat",
+            chat_id.clone(),
+            error,
+        )
+        .into_response()
+    })? {
+        return Err(remote_sidecar_missing_chat_error(
+            &state,
+            &database,
+            "chat.delete",
+            "delete-chat",
+            chat_id,
+        )
+        .into_response());
     }
     drop(database);
 
@@ -11923,12 +11990,27 @@ async fn remote_sidecar_chat_statistics(
     let database = sidecar_workspace_database(&state)?;
     if database
         .chat(&chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .map_err(|error| {
+            remote_sidecar_workspace_error_with_chat_not_found_context(
+                &state,
+                &database,
+                "chat.statistics",
+                "existing-chat-lookup",
+                chat_id.clone(),
+                error,
+            )
+            .into_response()
+        })?
         .is_none()
     {
-        return Err(
-            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response(),
-        );
+        return Err(remote_sidecar_missing_chat_error(
+            &state,
+            &database,
+            "chat.statistics",
+            "existing-chat-lookup",
+            chat_id,
+        )
+        .into_response());
     }
 
     let message_counts = database
@@ -12100,12 +12182,27 @@ async fn remote_sidecar_chat_todo_graph(
     let database = sidecar_workspace_database(&state)?;
     if database
         .chat(&chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+        .map_err(|error| {
+            remote_sidecar_workspace_error_with_chat_not_found_context(
+                &state,
+                &database,
+                "chat.todo",
+                "existing-chat-lookup",
+                chat_id.clone(),
+                error,
+            )
+            .into_response()
+        })?
         .is_none()
     {
-        return Err(
-            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response(),
-        );
+        return Err(remote_sidecar_missing_chat_error(
+            &state,
+            &database,
+            "chat.todo",
+            "existing-chat-lookup",
+            chat_id,
+        )
+        .into_response());
     }
     let status = query
         .get("status")
@@ -12213,12 +12310,27 @@ async fn remote_sidecar_enable_agent_team(
         .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
     if database
         .chat(&chat_id)
-        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .map_err(|error| {
+            remote_sidecar_workspace_error_with_chat_not_found_context(
+                &state,
+                &database,
+                "agent.team.enable",
+                "existing-chat-lookup",
+                chat_id.clone(),
+                error,
+            )
+            .into_response()
+        })?
         .is_none()
     {
-        return Err(
-            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response(),
-        );
+        return Err(remote_sidecar_missing_chat_error(
+            &state,
+            &database,
+            "agent.team.enable",
+            "existing-chat-lookup",
+            chat_id,
+        )
+        .into_response());
     }
     if database
         .agent_team_for_chat(&chat_id)
@@ -14441,7 +14553,17 @@ fn remote_sidecar_prepare_chat_context_with_options(
     } = options;
     let compression_snapshots = database
         .context_compression_snapshots_for_chat(chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+        .map_err(|error| {
+            remote_sidecar_workspace_error_with_chat_not_found_context(
+                state,
+                database,
+                "chat.prompt-assembly",
+                "existing-chat-lookup",
+                chat_id,
+                error,
+            )
+            .into_response()
+        })?;
     let compression_snapshots = crate::prompt::active_compression_snapshots(&compression_snapshots);
     let active_llm_snapshot_ids =
         crate::prompt::active_llm_checkpoint_snapshot_ids(&compression_snapshots);
@@ -14451,7 +14573,17 @@ fn remote_sidecar_prepare_chat_context_with_options(
         assistant_message_id,
         &active_llm_snapshot_ids,
     )
-    .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    .map_err(|error| {
+        remote_sidecar_workspace_error_with_chat_not_found_context(
+            state,
+            database,
+            "chat.prompt-assembly",
+            "existing-chat-lookup",
+            chat_id,
+            error,
+        )
+        .into_response()
+    })?;
     let covered_sequences = crate::prompt::snapshot_covered_sequences(&compression_snapshots);
 
     let mut filtered_messages = Vec::new();
@@ -14484,7 +14616,17 @@ fn remote_sidecar_prepare_chat_context_with_options(
     let tools = tool_catalog.tools.clone();
     let todo_graph_context = database
         .todo_graph(chat_id)
-        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .map_err(|error| {
+            remote_sidecar_workspace_error_with_chat_not_found_context(
+                state,
+                database,
+                "chat.prompt-assembly",
+                "existing-chat-lookup",
+                chat_id,
+                error,
+            )
+            .into_response()
+        })?
         .map(todo_graph_context_message)
         .transpose()
         .map_err(|error| error.into_response())?;
@@ -21468,8 +21610,29 @@ async fn remote_sidecar_start_chat_run(
         .await?;
         let chat = database
             .chat(&chat_id)
-            .map_err(ApiError::from_workspace_error)?
-            .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+            .map_err(|error| {
+                remote_sidecar_workspace_error_with_chat_not_found_context(
+                    &state,
+                    &database,
+                    "chat.stream",
+                    "preflight-chat-lookup",
+                    chat_id.clone(),
+                    error,
+                )
+            })?
+            .ok_or_else(|| {
+                crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                    crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::remote_sidecar(
+                        "chat.stream",
+                        "preflight-chat-lookup",
+                        &state.workspace_id,
+                        database.database_path(),
+                    )
+                    .with_chat_id(chat_id.clone())
+                    .with_queued_user_message_id(queued_user_message_id.clone())
+                    .with_agent_task_id_opt(plan_task_id.as_ref().map(ToString::to_string)),
+                )
+            })?;
         let user_message = database
             .message(&queued_user_message_id)
             .map_err(ApiError::from_workspace_error)?
@@ -21595,11 +21758,42 @@ async fn remote_sidecar_start_chat_run(
                 &run_id,
             ),
         }
-        .map_err(ApiError::from_workspace_error)?;
+        .map_err(|error| {
+            crate::ApiError::from_workspace_error_with_chat_not_found_context(
+                error,
+                crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::remote_sidecar(
+                    "chat.stream",
+                    "queued-run-claim",
+                    &state.workspace_id,
+                    database.database_path(),
+                )
+                .with_chat_id(chat_id.clone())
+                .with_queued_user_message_id(queued_user_message_id.clone())
+                .with_run_id(run_id.clone())
+                .with_agent_task_id_opt(agent_task_id.as_ref().map(ToString::to_string)),
+            )
+        })?;
         Ok::<(), ApiError>(())
     }
     .await;
     if let Err(error) = claim_result {
+        if error.has_chat_not_found_diagnostic() {
+            // A missing chat means the reservation cannot be durably closed:
+            // the chat row disappeared between preflight and claim. Return the
+            // diagnostic as an HTTP error before SSE begins so the proxy can
+            // correlate the sidecar failure by its response headers.
+            remote_sidecar_finish_active_run(&state, &run_id);
+            if let Some(plan_task) = plan_task.as_ref()
+                && remote_sidecar_fail_plan_task(&state, &plan_task.task_id, error.message())
+                    .is_err()
+            {
+                tracing::error!(
+                    task_id = %plan_task.task_id,
+                    "failed to close remote Plan task after missing-chat claim failure"
+                );
+            }
+            return Err(error);
+        }
         remote_sidecar_fail_reserved_start(
             &state,
             &run_id,
@@ -21933,9 +22127,26 @@ async fn remote_sidecar_context_usage(
     let database = sidecar_workspace_database(&state)?;
     database
         .chat(&chat_id)
-        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .map_err(|error| {
+            remote_sidecar_workspace_error_with_chat_not_found_context(
+                &state,
+                &database,
+                "context.usage",
+                "existing-chat-lookup",
+                chat_id.clone(),
+                error,
+            )
+            .into_response()
+        })?
         .ok_or_else(|| {
-            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response()
+            remote_sidecar_missing_chat_error(
+                &state,
+                &database,
+                "context.usage",
+                "existing-chat-lookup",
+                chat_id.clone(),
+            )
+            .into_response()
         })?;
 
     let requested_skill_ids = skill_ids.unwrap_or_default();
@@ -31139,25 +31350,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_sidecar_delete_chat_rejects_empty_and_missing_chat_ids() {
+    async fn remote_sidecar_delete_chat_rejects_an_empty_chat_id() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
 
-        for (chat_id, expected_error) in [
-            ("   ", "chat id must not be empty"),
-            ("missing-chat", "chat was not found: missing-chat"),
-        ] {
-            let response =
-                remote_sidecar_delete_chat(State(state.clone()), AxumPath(chat_id.to_string()))
-                    .await
-                    .expect_err("invalid chat id should fail");
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-                .await
-                .expect("error response body");
-            let payload: Value = serde_json::from_slice(&body).expect("error response json");
-            assert_eq!(payload["error"], expected_error);
-        }
+        let response = remote_sidecar_delete_chat(State(state), AxumPath("   ".to_string()))
+            .await
+            .expect_err("empty chat id should fail");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body");
+        let payload: Value = serde_json::from_slice(&body).expect("error response json");
+        assert_eq!(payload["error"], "chat id must not be empty");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_start_missing_chat_returns_only_safe_diagnostic_metadata() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        let start = remote_sidecar_start_chat_run(
+            state,
+            json!({
+                "chatId": "missing-chat",
+                "queuedUserMessageId": "queued-user",
+                "visibleAssistantMessageId": "assistant-message",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+                "message": "must not be exposed"
+            }),
+        )
+        .await;
+        let response = match start {
+            Ok(_) => panic!("missing chat should fail before sidecar startup"),
+            Err(error) => error.into_response(),
+        };
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let diagnostic_id = response
+            .headers()
+            .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_DIAGNOSTIC_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("diagnostic response header")
+            .to_string();
+        assert_eq!(
+            response
+                .headers()
+                .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_OPERATION_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("chat.stream")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_PHASE_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("preflight-chat-lookup")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error response body");
+        let text = String::from_utf8(body.to_vec()).expect("error response UTF-8");
+        let payload: Value = serde_json::from_str(&text).expect("error response JSON");
+
+        assert_eq!(payload["diagnostic"]["diagnosticId"], diagnostic_id);
+        assert_eq!(payload["diagnostic"]["operation"], "chat.stream");
+        assert_eq!(payload["diagnostic"]["phase"], "preflight-chat-lookup");
+        assert!(!text.contains("missing-chat"));
+        assert!(!text.contains("must not be exposed"));
+        assert!(!text.contains(&workspace.path().display().to_string()));
     }
 
     #[tokio::test]

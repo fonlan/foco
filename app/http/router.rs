@@ -808,6 +808,12 @@ async fn remote_workspace_proxy_middleware(
         Ok(resp) => {
             let status = resp.status();
             let headers = resp.headers().clone();
+            record_remote_chat_not_found_proxy_completion(
+                &headers,
+                &workspace_id,
+                &suffix,
+                status.as_u16(),
+            );
             let is_sse_response = response_is_event_stream(&headers);
             let mut builder = Response::builder().status(status);
             for (name, value) in headers.iter() {
@@ -985,6 +991,37 @@ fn response_is_event_stream(headers: &HeaderMap) -> bool {
                 .next()
                 .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
         })
+}
+
+fn record_remote_chat_not_found_proxy_completion(
+    headers: &HeaderMap,
+    workspace_id: &str,
+    proxy_route: &str,
+    status: u16,
+) {
+    let Some(diagnostic_id) = headers
+        .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_DIAGNOSTIC_HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return;
+    };
+    let operation = headers
+        .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_OPERATION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let phase = headers
+        .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_PHASE_HEADER)
+        .and_then(|value| value.to_str().ok());
+    tracing::warn!(
+        event = "chat_not_found_remote_proxy_completed",
+        diagnostic_id,
+        operation = ?operation,
+        phase = ?phase,
+        workspace_id,
+        runtime_topology = "remote-sidecar",
+        proxy_route,
+        http_status = status,
+        "remote sidecar returned a missing-chat diagnostic"
+    );
 }
 
 fn should_skip_proxy_response_header(name: &header::HeaderName) -> bool {
