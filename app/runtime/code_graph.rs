@@ -1034,9 +1034,9 @@ fn initialize_code_graph_execution_root(execution_root: &Path) -> AppResult<Code
     let watcher = start_code_graph_watcher(execution_root)?;
     tracing::info!(
         execution_root = %execution_root.display(),
-        watcher_idle_receive_timeout_ms = 100_u64,
-        watch_event_queue = "std_mpsc_unbounded",
-        watch_event_queue_overflow_observable = false,
+        watcher_idle_receive = "event_driven",
+        watch_event_queue = "bounded_coalescing",
+        watch_event_queue_overflow_observable = true,
         elapsed_ms = watcher_started_at.elapsed().as_millis() as u64,
         "started code graph filesystem watcher"
     );

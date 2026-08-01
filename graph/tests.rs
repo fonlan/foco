@@ -1,6 +1,7 @@
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -21,10 +22,14 @@ use crate::{
 #[test]
 fn watcher_diagnostics_tracks_only_counts_without_event_payloads() {
     let mut diagnostics = WatcherDiagnostics::new();
-    diagnostics.record_event(true);
-    diagnostics.record_event(false);
-    diagnostics.record_receive_timeout();
-    diagnostics.record_event_error();
+    diagnostics.record_batch(&crate::PendingWatchEvents {
+        dirty_paths: [PathBuf::from("src/lib.rs")].into_iter().collect(),
+        events_received: 2,
+        relevant_events: 1,
+        filtered_events: 1,
+        event_errors: 1,
+        fallback_reason: Some(crate::WatcherFallbackReason::DirtyPathOverflow),
+    });
     diagnostics.record_debounce_reset();
 
     let refresh_window = diagnostics.take_refresh_window();
@@ -32,11 +37,13 @@ fn watcher_diagnostics_tracks_only_counts_without_event_payloads() {
     assert_eq!(
         refresh_window,
         crate::WatcherDiagnosticCounters {
-            receive_timeouts: 1,
             events_received: 2,
             relevant_events: 1,
             filtered_events: 1,
             event_errors: 1,
+            event_batches: 1,
+            dirty_paths: 1,
+            fallback_refreshes: 1,
             debounce_resets: 1,
             refreshes: 1,
         }
@@ -49,6 +56,128 @@ fn watcher_diagnostics_tracks_only_counts_without_event_payloads() {
             ..Default::default()
         }
     );
+}
+
+#[test]
+fn watcher_accumulator_coalesces_repeated_source_events_into_one_bounded_batch() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = fs::canonicalize(workspace.path()).expect("canonical workspace");
+    let source_path = workspace_path.join("src/lib.rs");
+    fs::create_dir_all(source_path.parent().expect("source parent")).expect("source parent");
+    fs::write(&source_path, "pub fn first() {}\n").expect("source");
+    let (command_tx, command_rx) = mpsc::sync_channel(2);
+    let accumulator = crate::WatchEventAccumulator::new(workspace_path, command_tx);
+
+    for _ in 0..16 {
+        accumulator.record(Ok(watch_event([source_path.clone()])));
+    }
+
+    assert!(matches!(
+        command_rx.recv_timeout(Duration::from_millis(100)),
+        Ok(crate::WatcherCommand::EventsReady)
+    ));
+    let batch = accumulator.take_pending();
+    assert_eq!(batch.dirty_paths.len(), 1);
+    assert_eq!(batch.relevant_events, 16);
+    assert!(matches!(
+        command_rx.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+}
+
+#[test]
+fn watcher_accumulator_ignores_internal_and_directory_events_without_waking_worker() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = fs::canonicalize(workspace.path()).expect("canonical workspace");
+    let ignored_paths = [
+        ".git/hooks/pre-commit.rs",
+        ".foco/runtime.rs",
+        ".mem/facts.rs",
+        "node_modules/package/index.js",
+        "target/generated.rs",
+        "dist/assets/app.js",
+    ]
+    .map(|relative_path| workspace_path.join(relative_path));
+    for ignored_path in &ignored_paths {
+        fs::create_dir_all(ignored_path.parent().expect("ignored parent")).expect("ignored parent");
+        fs::write(ignored_path, "pub fn generated() {}\n").expect("ignored source");
+    }
+    let (command_tx, command_rx) = mpsc::sync_channel(2);
+    let accumulator = crate::WatchEventAccumulator::new(workspace_path.clone(), command_tx);
+
+    for ignored_path in ignored_paths {
+        accumulator.record(Ok(watch_event([ignored_path])));
+    }
+    accumulator.record(Ok(watch_event([workspace_path.join("target")])));
+
+    assert!(matches!(
+        command_rx.recv_timeout(Duration::from_millis(20)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    let batch = accumulator.take_pending();
+    assert!(!batch.has_work());
+    assert_eq!(batch.filtered_events, 7);
+}
+
+#[test]
+fn watcher_accumulator_requests_safe_fallback_when_dirty_path_limit_is_exceeded() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = fs::canonicalize(workspace.path()).expect("canonical workspace");
+    let (command_tx, command_rx) = mpsc::sync_channel(2);
+    let accumulator = crate::WatchEventAccumulator::new(workspace_path.clone(), command_tx);
+
+    for index in 0..=crate::MAX_PENDING_WATCH_PATHS {
+        accumulator.record(Ok(watch_event([
+            workspace_path.join(format!("src/{index}.rs"))
+        ])));
+    }
+
+    assert!(matches!(
+        command_rx.recv_timeout(Duration::from_millis(100)),
+        Ok(crate::WatcherCommand::EventsReady)
+    ));
+    let batch = accumulator.take_pending();
+    assert_eq!(
+        batch.fallback_reason,
+        Some(crate::WatcherFallbackReason::DirtyPathOverflow)
+    );
+}
+
+#[test]
+fn watcher_accumulator_requests_safe_fallback_for_notify_errors() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = fs::canonicalize(workspace.path()).expect("canonical workspace");
+    let (command_tx, command_rx) = mpsc::sync_channel(2);
+    let accumulator = crate::WatchEventAccumulator::new(workspace_path, command_tx);
+
+    accumulator.record(Err(notify::Error::generic("simulated event error")));
+
+    assert!(matches!(
+        command_rx.recv_timeout(Duration::from_millis(100)),
+        Ok(crate::WatcherCommand::EventsReady)
+    ));
+    let batch = accumulator.take_pending();
+    assert_eq!(
+        batch.fallback_reason,
+        Some(crate::WatcherFallbackReason::NotifyError)
+    );
+}
+
+#[test]
+fn watcher_drop_stops_an_idle_worker_without_polling_delay() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let watcher = crate::start_code_graph_watcher(workspace.path()).expect("start watcher");
+    let started_at = Instant::now();
+
+    drop(watcher);
+
+    assert!(started_at.elapsed() < Duration::from_secs(1));
+}
+
+fn watch_event(paths: impl IntoIterator<Item = PathBuf>) -> notify::Event {
+    let mut event = notify::Event::new(notify::EventKind::Any);
+    event.paths.extend(paths);
+    event
 }
 
 #[test]
@@ -179,6 +308,171 @@ fn watcher_reindexes_a_modified_python_file() {
     assert!(
         indexed,
         "watcher did not persist the modified Python symbol"
+    );
+}
+
+#[test]
+fn watcher_refreshes_graph_rows_after_a_source_rename() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source_path = workspace.path().join("before.py");
+    let renamed_path = workspace.path().join("after.py");
+    fs::write(&source_path, "def before():\n    return 1\n").expect("initial source");
+    index_workspace(workspace.path()).expect("initial index");
+    let watcher =
+        crate::start_code_graph_watcher_with_debounce(workspace.path(), Duration::from_millis(20))
+            .expect("start watcher");
+
+    fs::rename(&source_path, &renamed_path).expect("rename source");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut refreshed = false;
+    while Instant::now() < deadline {
+        let connection = graph_connection(workspace.path());
+        let indexed_paths = query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_files WHERE path = 'after.py'",
+        );
+        let stale_paths = query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_files WHERE path = 'before.py'",
+        );
+        if indexed_paths == 1 && stale_paths == 0 {
+            refreshed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    drop(watcher);
+
+    assert!(refreshed, "watcher did not refresh graph rows after rename");
+}
+
+#[test]
+fn watcher_indexes_a_created_source_file() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    index_workspace(workspace.path()).expect("initial empty index");
+    let watcher =
+        crate::start_code_graph_watcher_with_debounce(workspace.path(), Duration::from_millis(20))
+            .expect("start watcher");
+    let source_path = workspace.path().join("created.py");
+
+    fs::write(&source_path, "def created():\n    return 1\n").expect("create source");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut indexed = false;
+    while Instant::now() < deadline {
+        let connection = graph_connection(workspace.path());
+        if query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_symbols WHERE qualified_name = 'created'",
+        ) == 1
+        {
+            indexed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    drop(watcher);
+
+    assert!(indexed, "watcher did not index the created Python symbol");
+}
+
+#[test]
+fn watcher_removes_graph_rows_after_a_source_delete() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source_path = workspace.path().join("removed.py");
+    fs::write(&source_path, "def removed():\n    return 1\n").expect("initial source");
+    index_workspace(workspace.path()).expect("initial index");
+    let watcher =
+        crate::start_code_graph_watcher_with_debounce(workspace.path(), Duration::from_millis(20))
+            .expect("start watcher");
+
+    fs::remove_file(&source_path).expect("remove source");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut removed = false;
+    while Instant::now() < deadline {
+        let connection = graph_connection(workspace.path());
+        if query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_files WHERE path = 'removed.py'",
+        ) == 0
+        {
+            removed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    drop(watcher);
+
+    assert!(
+        removed,
+        "watcher did not remove graph rows for the deleted source"
+    );
+}
+
+#[test]
+fn watcher_ignores_internal_tree_event_storms_without_refreshing() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    index_workspace(workspace.path()).expect("initial empty index");
+    let watcher =
+        crate::start_code_graph_watcher_with_debounce(workspace.path(), Duration::from_millis(20))
+            .expect("start watcher");
+    let generated_directory = workspace.path().join("target/generated");
+    fs::create_dir_all(&generated_directory).expect("create generated directory");
+
+    for index in 0..64 {
+        fs::write(
+            generated_directory.join(format!("generated-{index}.rs")),
+            "pub fn generated() {}\n",
+        )
+        .expect("write generated source");
+    }
+    thread::sleep(Duration::from_millis(200));
+
+    assert_eq!(watcher.refresh_count(), 0);
+    drop(watcher);
+}
+
+#[test]
+fn watcher_can_restart_after_an_idle_worker_stops() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source_path = workspace.path().join("restart.py");
+    fs::write(&source_path, "def first():\n    return 1\n").expect("initial source");
+    index_workspace(workspace.path()).expect("initial index");
+    let first_watcher =
+        crate::start_code_graph_watcher_with_debounce(workspace.path(), Duration::from_millis(20))
+            .expect("start first watcher");
+    drop(first_watcher);
+    let second_watcher =
+        crate::start_code_graph_watcher_with_debounce(workspace.path(), Duration::from_millis(20))
+            .expect("restart watcher");
+
+    fs::write(
+        &source_path,
+        "def first():\n    return 1\n\ndef after_restart():\n    return first()\n",
+    )
+    .expect("modify source");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut indexed = false;
+    while Instant::now() < deadline {
+        let connection = graph_connection(workspace.path());
+        if query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_symbols WHERE qualified_name = 'after_restart'",
+        ) == 1
+        {
+            indexed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    drop(second_watcher);
+
+    assert!(
+        indexed,
+        "restarted watcher did not persist the modified symbol"
     );
 }
 
