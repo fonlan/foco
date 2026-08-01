@@ -410,6 +410,39 @@ impl MemoryKind {
     }
 }
 
+/// Unified kind/scope compatibility policy.
+///
+/// `project_fact` and `project_decision` describe a specific workspace and must
+/// never be newly created, extracted, or promoted into `MemoryScope::Global`.
+/// Historical global project-class rows stay readable (and editable in place)
+/// so users can migrate them; this policy only guards write paths that would
+/// create or change a fact into an illegal combination.
+pub fn memory_scope_allows_kind(scope: MemoryScope, kind: MemoryKind) -> bool {
+    !matches!(
+        (scope, kind),
+        (
+            MemoryScope::Global,
+            MemoryKind::ProjectFact | MemoryKind::ProjectDecision
+        )
+    )
+}
+
+pub fn ensure_memory_kind_scope_allowed(
+    scope: MemoryScope,
+    kind: MemoryKind,
+) -> Result<(), MemoryDatabaseError> {
+    if memory_scope_allows_kind(scope, kind) {
+        Ok(())
+    } else {
+        Err(MemoryDatabaseError::InvalidMemoryInput {
+            message: format!(
+                "{} memory kind is not allowed in global scope; use workspace scope",
+                kind.as_str()
+            ),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MemorySourceType {
     ChatMessage,
@@ -758,6 +791,7 @@ impl MemoryDatabase {
     pub fn insert_fact(&mut self, fact: NewMemoryFact<'_>) -> Result<(), MemoryDatabaseError> {
         self.validate_scope(fact.scope)?;
         validate_fact(&fact)?;
+        ensure_memory_kind_scope_allowed(fact.scope, fact.kind)?;
 
         let database_path = self.database_path.clone();
         let now = now_timestamp();
@@ -810,6 +844,19 @@ impl MemoryDatabase {
         validate_fact_update(&fact)?;
         if let Some(scope) = fact.scope {
             self.validate_scope(scope)?;
+        }
+        // Enforce the unified kind/scope policy whenever either scope or kind is
+        // changing, using the resulting combination. Historical global
+        // project-class rows remain readable and can still be updated without
+        // changing kind/scope (e.g. fact text or status).
+        if fact.scope.is_some() || fact.kind.is_some() {
+            if let Some(current) = self.fact(fact.id)? {
+                let current_scope = MemoryScope::parse(&current.scope)?;
+                let current_kind = MemoryKind::parse(&current.kind)?;
+                let result_scope = fact.scope.unwrap_or(current_scope);
+                let result_kind = fact.kind.unwrap_or(current_kind);
+                ensure_memory_kind_scope_allowed(result_scope, result_kind)?;
+            }
         }
 
         let database_path = self.database_path.clone();
@@ -3289,6 +3336,8 @@ impl MemoryDatabase {
                 .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
                     message: format!("memory fact was not found: {source_fact_id}"),
                 })?;
+        let source_kind = memory_kind_from_str(&fact.kind)?;
+        ensure_memory_kind_scope_allowed(target_scope, source_kind)?;
         let sources = self.sources_for_fact(source_fact_id)?;
 
         for (index, source) in sources.iter().enumerate() {
@@ -3314,7 +3363,7 @@ impl MemoryDatabase {
             scope: target_scope,
             chat_id: target_chat_id,
             status: memory_status_from_str(&fact.status)?,
-            kind: memory_kind_from_str(&fact.kind)?,
+            kind: source_kind,
             fact: &fact.fact,
             confidence: fact.confidence,
             pinned: fact.pinned,
@@ -3345,6 +3394,8 @@ impl MemoryDatabase {
                 .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
                     message: format!("memory fact was not found: {source_fact_id}"),
                 })?;
+        let source_kind = memory_kind_from_str(&fact.kind)?;
+        ensure_memory_kind_scope_allowed(target_scope, source_kind)?;
         let sources = self.sources_for_fact(source_fact_id)?;
 
         for (index, source) in sources.iter().enumerate() {
@@ -3370,7 +3421,7 @@ impl MemoryDatabase {
             scope: target_scope,
             chat_id: target_chat_id,
             status: memory_status_from_str(&fact.status)?,
-            kind: memory_kind_from_str(&fact.kind)?,
+            kind: source_kind,
             fact: &fact.fact,
             confidence: fact.confidence,
             pinned: fact.pinned,
@@ -4986,6 +5037,274 @@ mod tests {
     use super::*;
     use crate::workspace::{WorkspaceDatabase, workspace_database_path};
     use rusqlite::{Connection, params};
+
+    #[test]
+    fn kind_scope_policy_rejects_global_project_memories() {
+        for kind in [MemoryKind::ProjectFact, MemoryKind::ProjectDecision] {
+            assert!(!memory_scope_allows_kind(MemoryScope::Global, kind));
+            assert!(matches!(
+                ensure_memory_kind_scope_allowed(MemoryScope::Global, kind),
+                Err(MemoryDatabaseError::InvalidMemoryInput { .. })
+            ));
+        }
+        for kind in [
+            MemoryKind::Preference,
+            MemoryKind::Procedure,
+            MemoryKind::Constraint,
+            MemoryKind::Episode,
+            MemoryKind::UserNote,
+        ] {
+            assert!(memory_scope_allows_kind(MemoryScope::Global, kind));
+            assert!(ensure_memory_kind_scope_allowed(MemoryScope::Global, kind).is_ok());
+        }
+        for kind in [
+            MemoryKind::Preference,
+            MemoryKind::ProjectFact,
+            MemoryKind::ProjectDecision,
+            MemoryKind::Procedure,
+            MemoryKind::Constraint,
+            MemoryKind::Episode,
+            MemoryKind::UserNote,
+        ] {
+            assert!(memory_scope_allows_kind(MemoryScope::Workspace, kind));
+            assert!(memory_scope_allows_kind(MemoryScope::Chat, kind));
+            assert!(ensure_memory_kind_scope_allowed(MemoryScope::Workspace, kind).is_ok());
+            assert!(ensure_memory_kind_scope_allowed(MemoryScope::Chat, kind).is_ok());
+        }
+    }
+
+    #[test]
+    fn insert_fact_rejects_global_project_memories_but_keeps_historical_readable() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+
+        database
+            .insert_source(NewMemorySource {
+                id: "source-project-global",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Test source",
+                content: "source content",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        let error = database
+            .insert_fact(NewMemoryFact {
+                id: "fact-project-global",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::ProjectFact,
+                fact: "Project fact must not be global.",
+                confidence: None,
+                pinned: false,
+                source_ids: &["source-project-global"],
+                metadata_json: "{}",
+            })
+            .expect_err("global project fact insert must fail");
+        assert!(matches!(
+            error,
+            MemoryDatabaseError::InvalidMemoryInput { .. }
+        ));
+
+        // Global preference and workspace project-class rows remain writable.
+        database
+            .insert_fact(NewMemoryFact {
+                id: "fact-preference-global",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::Preference,
+                fact: "User-wide preference.",
+                confidence: None,
+                pinned: false,
+                source_ids: &["source-project-global"],
+                metadata_json: "{}",
+            })
+            .expect("global preference insert");
+
+        let workspace_dir = profile.path().join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "kind scope policy")
+                .expect("chat insert");
+        }
+        let mut workspace =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        workspace
+            .insert_source(NewMemorySource {
+                id: "source-project-workspace",
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Test source",
+                content: "source content",
+                metadata_json: "{}",
+            })
+            .expect("workspace source insert");
+        workspace
+            .insert_fact(NewMemoryFact {
+                id: "fact-project-workspace",
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::ProjectDecision,
+                fact: "Project decision belongs to a workspace.",
+                confidence: None,
+                pinned: false,
+                source_ids: &["source-project-workspace"],
+                metadata_json: "{}",
+            })
+            .expect("workspace project decision insert");
+
+        // A historical global project-class row (written before the policy)
+        // remains readable and editable in place without changing kind/scope.
+        drop(database);
+        let connection = Connection::open(global_memory_database_path(profile.path()))
+            .expect("open global memory database");
+        connection
+            .execute_batch(
+                "INSERT INTO memory_facts
+                    (id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                     expires_at, metadata_json, created_at, updated_at)
+                 VALUES
+                    ('fact-historical-project', 'global', NULL, 'active', 'project_fact',
+                     'Historical global project fact.', 0.8, 0, 1, NULL, '{}',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+            )
+            .expect("insert historical global project fact");
+        drop(connection);
+        let mut database =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("reopen global memory");
+        let historical = database
+            .fact("fact-historical-project")
+            .expect("historical fact query")
+            .expect("historical fact");
+        assert_eq!(historical.kind, "project_fact");
+        assert_eq!(historical.scope, "global");
+        database
+            .update_fact(UpdateMemoryFact {
+                id: "fact-historical-project",
+                fact: Some("Historical global project fact (edited in place)."),
+                ..UpdateMemoryFact::default()
+            })
+            .expect("historical global project fact stays editable without kind/scope change");
+        let error = database
+            .update_fact(UpdateMemoryFact {
+                id: "fact-historical-project",
+                kind: Some(MemoryKind::ProjectDecision),
+                ..UpdateMemoryFact::default()
+            })
+            .expect_err("changing a global fact kind to project must fail");
+        assert!(matches!(
+            error,
+            MemoryDatabaseError::InvalidMemoryInput { .. }
+        ));
+        let promoted_error = database
+            .promote_fact(
+                "fact-historical-project",
+                "fact-promoted",
+                MemoryScope::Global,
+                None,
+            )
+            .expect_err("promoting a global project fact within global scope must fail");
+        assert!(matches!(
+            promoted_error,
+            MemoryDatabaseError::InvalidMemoryInput { .. }
+        ));
+    }
+
+    #[test]
+    fn promote_rejects_workspace_project_memories_to_global() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace_dir = profile.path().join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "promote policy")
+                .expect("chat insert");
+        }
+        let mut workspace =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        workspace
+            .insert_source(NewMemorySource {
+                id: "source-project",
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Test source",
+                content: "source content",
+                metadata_json: "{}",
+            })
+            .expect("workspace source insert");
+        workspace
+            .insert_fact(NewMemoryFact {
+                id: "fact-project",
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::ProjectFact,
+                fact: "Workspace project fact.",
+                confidence: None,
+                pinned: false,
+                source_ids: &["source-project"],
+                metadata_json: "{}",
+            })
+            .expect("workspace project fact insert");
+
+        let mut global =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        let error = workspace
+            .promote_fact_to_database(
+                "fact-project",
+                &mut global,
+                "fact-promoted-global",
+                MemoryScope::Global,
+                None,
+            )
+            .expect_err("promoting a workspace project fact to global must fail");
+        assert!(matches!(
+            error,
+            MemoryDatabaseError::InvalidMemoryInput { .. }
+        ));
+        assert!(
+            global
+                .fact("fact-promoted-global")
+                .expect("query")
+                .is_none()
+        );
+
+        // Moving a workspace project fact to a workspace target stays allowed.
+        let mut target_workspace =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("target workspace memory database");
+        target_workspace
+            .promote_fact(
+                "fact-project",
+                "fact-project-promoted",
+                MemoryScope::Workspace,
+                None,
+            )
+            .expect("workspace to workspace promote stays allowed");
+        assert!(
+            target_workspace
+                .fact("fact-project-promoted")
+                .expect("query")
+                .is_some()
+        );
+    }
 
     #[test]
     fn global_database_creates_memory_schema() {

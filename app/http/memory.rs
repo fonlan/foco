@@ -13,7 +13,7 @@ use foco_store::memory::{
     MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
     MemoryExtractionJobRecord, MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind,
     MemoryScope, MemorySourceRecord, MemoryStatus, NewMemoryFact, NewMemorySource,
-    UpdateMemoryFact, UpdateMemorySource,
+    UpdateMemoryFact, UpdateMemorySource, ensure_memory_kind_scope_allowed,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -479,6 +479,7 @@ pub(crate) async fn create_manual_memory(
     let config = config_snapshot(&state)?;
     let scope = MemoryScope::parse(request.scope.trim()).map_err(ApiError::from_memory_error)?;
     let kind = MemoryKind::parse(request.kind.trim()).map_err(ApiError::from_memory_error)?;
+    ensure_memory_kind_scope_allowed(scope, kind).map_err(ApiError::from_memory_error)?;
     let chat_id = normalized_optional_text(request.chat_id);
     let mut database =
         open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
@@ -845,6 +846,11 @@ pub(crate) async fn edit_memory(
         .map(MemoryKind::parse)
         .transpose()
         .map_err(ApiError::from_memory_error)?;
+    if let Some(kind) = kind {
+        // Editing a memory into a project-class kind while it lives in global
+        // scope would violate the unified kind/scope policy.
+        ensure_memory_kind_scope_allowed(scope, kind).map_err(ApiError::from_memory_error)?;
+    }
     let mut database =
         open_memory_database(&state, &config, scope, request.workspace_id.as_deref())?;
 
@@ -1005,6 +1011,20 @@ pub(crate) async fn promote_memory(
         source_scope,
         request.workspace_id.as_deref(),
     )?;
+
+    // Promote (or move) must never create a project-class global memory.
+    let source_fact = source_database
+        .fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| {
+            ApiError::from_status_message(
+                StatusCode::NOT_FOUND,
+                format!("memory fact was not found: {memory_id}"),
+            )
+        })?;
+    let source_kind = MemoryKind::parse(&source_fact.kind).map_err(ApiError::from_memory_error)?;
+    ensure_memory_kind_scope_allowed(target_scope, source_kind)
+        .map_err(ApiError::from_memory_error)?;
 
     let memory = if target_scope != MemoryScope::Global
         && source_scope != MemoryScope::Global

@@ -3487,6 +3487,75 @@ describe("app-settings verification surfaces", () => {
     confirmSpy.mockRestore();
   });
 
+  it("switches create memory scope to workspace when a project kind is selected", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    expect(await screen.findByText("Memory settings")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Create memory" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Create memory" });
+    // Re-query per interaction: the HeroUI trigger node is replaced when the
+    // controlled value changes, so a captured element goes stale.
+    const scopeSelect = () => within(dialog).getByLabelText("Memory scope");
+    const kindSelect = () => within(dialog).getByLabelText("Memory kind");
+
+    // Choosing a project-class kind must switch the create form from its
+    // default global scope to workspace scope.
+    await userEvent.selectOptions(kindSelect(), "project_fact");
+
+    // The scope trigger now displays the workspace option and the form explains
+    // that project-class memories cannot use global scope.
+    expect(within(dialog).getAllByText("Workspace memory").length).toBeGreaterThan(0);
+    expect(
+      await screen.findByText(
+        "Project facts and project decisions are always stored in workspace scope and cannot use global scope.",
+      ),
+    ).toBeInTheDocument();
+
+    await userEvent.type(
+      within(dialog).getByLabelText("Memory fact"),
+      "Project fact memory",
+    );
+    const save = within(dialog).getByRole("button", { name: "Create memory" });
+    expect(save).not.toBeDisabled();
+    await userEvent.click(save);
+    await waitFor(() => {
+      const manualCall = fetchMock.mock.calls.find(([url]) => url === "/api/memory/manual");
+      expect(manualCall).toBeDefined();
+      expect(JSON.parse(String(manualCall?.[1]?.body))).toMatchObject({
+        kind: "project_fact",
+        scope: "workspace",
+      });
+    });
+  });
+
+  it("hides promote-to-global for workspace project memories", async () => {
+    appTestState.memoryListAdditional.push({
+      ...workspaceMemory,
+      fact: "Workspace project memory",
+      id: "memory-workspace-project-1",
+      kind: "project_fact",
+    });
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    expect(await screen.findByText("Memory settings")).toBeInTheDocument();
+    await userEvent.selectOptions(screen.getByLabelText("Memory scope"), "workspace");
+    expect(await screen.findByText("Workspace project memory")).toBeInTheDocument();
+    expect(await screen.findByText(workspaceMemory.fact)).toBeInTheDocument();
+
+    // Only the non-project workspace memory keeps its promote-to-global action.
+    expect(screen.getAllByRole("button", { name: "Promote one level" })).toHaveLength(1);
+  });
+
   it("deletes and approves memories", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
     const fetchMock = vi.mocked(fetch);

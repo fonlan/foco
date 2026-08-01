@@ -1345,6 +1345,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Extraction failures": "抽取失败",
     "No extraction failures": "暂无抽取失败",
     "Memory extraction failed": "记忆抽取失败",
+    "Project facts and project decisions are always stored in workspace scope and cannot use global scope.":
+      "项目事实与项目决策始终保存在工作区作用域，不能使用全局作用域。",
     "Web service listen address": "Web 服务监听地址",
     "System prompt and user prompt context": "系统提示词与用户提示词上下文",
     "Search API credentials and runtime web tools":

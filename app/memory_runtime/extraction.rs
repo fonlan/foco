@@ -9,7 +9,7 @@ use foco_store::{
     memory::{
         MemoryDatabase, MemoryExtractionJobStatus, MemoryFactRecord, MemoryKind,
         MemoryRelationKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryEdge,
-        NewMemoryExtractionJob, NewMemoryFact, NewMemorySource,
+        NewMemoryExtractionJob, NewMemoryFact, NewMemorySource, memory_scope_allows_kind,
     },
     workspace::WorkspaceDatabase,
 };
@@ -1015,13 +1015,25 @@ pub(crate) fn validate_extracted_memory_facts(
     let mut validated = Vec::with_capacity(output.facts.len());
 
     for (index, fact) in output.facts.iter().enumerate() {
-        let scope = MemoryScope::parse(fact.scope.trim()).map_err(ApiError::from_memory_error)?;
+        let requested_scope =
+            MemoryScope::parse(fact.scope.trim()).map_err(ApiError::from_memory_error)?;
         let kind = MemoryKind::parse(fact.kind.trim()).map_err(ApiError::from_memory_error)?;
         if kind == MemoryKind::UserNote {
             return Err(ApiError::bad_request(format!(
                 "extracted fact {index} must not use user_note kind"
             )));
         }
+        // Automatic extraction always originates from a concrete workspace, so a
+        // model suggestion of global for a project-class kind is corrected to
+        // workspace instead of dropping the whole batch. The requested and
+        // effective scopes are recorded in fact metadata for auditability.
+        let scope = if requested_scope == MemoryScope::Global
+            && !memory_scope_allows_kind(requested_scope, kind)
+        {
+            MemoryScope::Workspace
+        } else {
+            requested_scope
+        };
         let fact_text = fact.fact.trim();
         if fact_text.is_empty() {
             return Err(ApiError::bad_request(format!(
@@ -1083,6 +1095,8 @@ pub(crate) fn validate_extracted_memory_facts(
 
         let metadata_json = serde_json::to_string(&json!({
             "source": "memory_extraction",
+            "requestedScope": fact.scope.trim(),
+            "effectiveScope": scope.as_str(),
             "relationCandidates": &fact.relation_candidates,
             "evidenceReferences": &fact.evidence_references,
         }))
@@ -1246,5 +1260,89 @@ mod tests {
             memory_extraction_ignore_reason("extracted fact fact-1 has invalid confidence"),
             "semantic_invalid"
         );
+    }
+
+    #[test]
+    fn extraction_normalizes_global_project_class_scope_to_workspace() {
+        let evidence = vec![MemoryExtractionEvidenceCandidate {
+            evidence_id: "user_message".to_string(),
+            source_type: MemorySourceType::ChatMessage,
+            source_id: "user-1".to_string(),
+            title: "User message".to_string(),
+            content: "Evidence content".to_string(),
+            metadata: json!({}),
+        }];
+        let evidence_by_id = evidence
+            .iter()
+            .map(|item| (item.evidence_id.as_str(), item))
+            .collect::<HashMap<_, _>>();
+
+        for kind in ["project_fact", "project_decision"] {
+            let output = MemoryExtractionOutput {
+                facts: vec![ExtractedMemoryFact {
+                    scope: "global".to_string(),
+                    kind: kind.to_string(),
+                    fact: "Project-class fact from a workspace turn.".to_string(),
+                    confidence: Some(0.9),
+                    relation_candidates: Vec::new(),
+                    evidence_references: vec![ExtractedMemoryEvidenceReference {
+                        evidence_id: "user_message".to_string(),
+                        quote: Some("Evidence content".to_string()),
+                    }],
+                }],
+            };
+            let validated =
+                validate_extracted_memory_facts(&output, &evidence_by_id).expect("validated");
+            assert_eq!(validated.len(), 1);
+            assert_eq!(validated[0].scope, MemoryScope::Workspace);
+            let metadata: Value =
+                serde_json::from_str(&validated[0].metadata_json).expect("metadata JSON");
+            assert_eq!(metadata["requestedScope"], "global");
+            assert_eq!(metadata["effectiveScope"], "workspace");
+        }
+    }
+
+    #[test]
+    fn extraction_keeps_global_preference_and_workspace_project_class_scopes() {
+        let evidence = vec![MemoryExtractionEvidenceCandidate {
+            evidence_id: "user_message".to_string(),
+            source_type: MemorySourceType::ChatMessage,
+            source_id: "user-1".to_string(),
+            title: "User message".to_string(),
+            content: "Evidence content".to_string(),
+            metadata: json!({}),
+        }];
+        let evidence_by_id = evidence
+            .iter()
+            .map(|item| (item.evidence_id.as_str(), item))
+            .collect::<HashMap<_, _>>();
+
+        for (requested_scope, kind, expected) in [
+            ("global", "preference", MemoryScope::Global),
+            ("workspace", "project_fact", MemoryScope::Workspace),
+            ("chat", "project_decision", MemoryScope::Chat),
+        ] {
+            let output = MemoryExtractionOutput {
+                facts: vec![ExtractedMemoryFact {
+                    scope: requested_scope.to_string(),
+                    kind: kind.to_string(),
+                    fact: "Extracted memory fact.".to_string(),
+                    confidence: Some(0.8),
+                    relation_candidates: Vec::new(),
+                    evidence_references: vec![ExtractedMemoryEvidenceReference {
+                        evidence_id: "user_message".to_string(),
+                        quote: Some("Evidence content".to_string()),
+                    }],
+                }],
+            };
+            let validated =
+                validate_extracted_memory_facts(&output, &evidence_by_id).expect("validated");
+            assert_eq!(validated.len(), 1);
+            assert_eq!(validated[0].scope, expected);
+            let metadata: Value =
+                serde_json::from_str(&validated[0].metadata_json).expect("metadata JSON");
+            assert_eq!(metadata["requestedScope"], requested_scope);
+            assert_eq!(metadata["effectiveScope"], expected.as_str());
+        }
     }
 }

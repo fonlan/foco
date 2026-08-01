@@ -3415,7 +3415,7 @@ export function SettingsPanel({
   function promoteMemoryOneLevel(memory: MemoryFactRecord) {
     if (memory.scope === "chat") {
       void promoteMemory(memory.id, "workspace");
-    } else if (memory.scope === "workspace") {
+    } else if (memory.scope === "workspace" && !isProjectMemoryKind(memory.kind)) {
       void promoteMemory(memory.id, "global");
     }
   }
@@ -7431,7 +7431,9 @@ export function SettingsPanel({
                                 }
                                 value={manualMemoryForm.scope}
                               >
-                                <option value="global">{t("Global memory")}</option>
+                                <option disabled={isProjectMemoryKind(manualMemoryForm.kind)} value="global">
+                                  {t("Global memory")}
+                                </option>
                                 <option value="workspace">{t("Workspace memory")}</option>
                                 <option value="chat">{t("Chat memory")}</option>
                               </SettingsSelect>
@@ -7485,19 +7487,45 @@ export function SettingsPanel({
                           <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
-                              setManualMemoryForm((current) => ({
-                                ...current,
-                                kind: event.target.value,
-                              }))
+                              setManualMemoryForm((current) => {
+                                const kind = event.target.value;
+                                // Project-class kinds never live in global
+                                // scope: switch a global create form to
+                                // workspace so it cannot be submitted as global.
+                                const scope =
+                                  current.scope === "global" && isProjectMemoryKind(kind)
+                                    ? "workspace"
+                                    : current.scope;
+                                return { ...current, kind, scope };
+                              })
                             }
                             value={manualMemoryForm.kind}
                           >
-                            {MEMORY_KIND_OPTIONS.map((kind) => (
-                              <option key={kind} value={kind}>
-                                {memoryKindLabel(kind, t)}
-                              </option>
-                            ))}
+                            {MEMORY_KIND_OPTIONS.map((kind) => {
+                              // In edit mode the scope select is hidden (the
+                              // scope is fixed), so a global memory cannot be
+                              // changed into a project-class kind. In create
+                              // mode the form auto-switches to workspace scope
+                              // when a project kind is chosen, so the option
+                              // must stay selectable.
+                              const disabled =
+                                memoryDialogMode === "edit" &&
+                                manualMemoryForm.scope === "global" &&
+                                isProjectMemoryKind(kind);
+                              return (
+                                <option disabled={disabled} key={kind} value={kind}>
+                                  {memoryKindLabel(kind, t)}
+                                </option>
+                              );
+                            })}
                           </SettingsSelect>
+                          {isProjectMemoryKind(manualMemoryForm.kind) ? (
+                            <p className="mt-1 text-xs text-[var(--muted)]">
+                              {t(
+                                "Project facts and project decisions are always stored in workspace scope and cannot use global scope.",
+                              )}
+                            </p>
+                          ) : null}
                         </label>
                         <div className="grid gap-3 sm:grid-cols-2">
                           <SettingsTextField
@@ -7715,7 +7743,9 @@ export function SettingsPanel({
                           isSavingMemory ||
                           !manualMemoryForm.fact.trim() ||
                           (manualMemoryForm.scope === "chat" &&
-                            !manualMemoryForm.chatId.trim())
+                            !manualMemoryForm.chatId.trim()) ||
+                          (manualMemoryForm.scope === "global" &&
+                            isProjectMemoryKind(manualMemoryForm.kind))
                         }
                         title={
                           memoryDialogMode === "create"
@@ -8901,7 +8931,9 @@ export function SettingsPanel({
                               title={memoryEnabledToggleLabel}
                               type="checkbox"
                             />
-                          {memory.scope !== "global" ? (
+                          {memory.scope === "chat" ||
+                          (memory.scope === "workspace" &&
+                            !isProjectMemoryKind(memory.kind)) ? (
                             <SettingsButton
                               aria-label={t("Promote one level")}
                               className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
@@ -13791,6 +13823,10 @@ function MemorySourceReadonlyDetails({
       </div>
     </div>
   );
+}
+
+function isProjectMemoryKind(kind: string): boolean {
+  return kind === "project_fact" || kind === "project_decision";
 }
 
 function memoryKindLabel(kind: string, t: Translate) {

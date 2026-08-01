@@ -34643,7 +34643,13 @@ fn insert_test_memory_fact_with_status(
             scope,
             chat_id,
             status,
-            kind: MemoryKind::ProjectFact,
+            // Global-scoped seeds must use a kind the unified scope policy
+            // allows at global scope (project-class kinds are workspace-only).
+            kind: if scope == MemoryScope::Global {
+                MemoryKind::Preference
+            } else {
+                MemoryKind::ProjectFact
+            },
             fact,
             confidence: None,
             pinned,
@@ -39217,6 +39223,127 @@ async fn memory_enabled_http_validates_scope_location_and_missing_fact() {
             .expect("memory enabled validation request");
         assert_eq!(response.status(), expected_status, "payload: {payload}");
     }
+
+    app_task.abort();
+}
+
+#[tokio::test]
+async fn memory_http_rejects_global_project_class_manual_and_promote() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    {
+        let mut workspace_database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        workspace_database
+            .insert_chat("chat-1", "Memory scope policy")
+            .expect("chat insert");
+        drop(workspace_database);
+        let mut workspace =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut workspace,
+            "source-project-http",
+            "fact-project-http",
+            MemoryScope::Workspace,
+            None,
+            "Workspace project fact for promote rejection.",
+            false,
+        );
+    }
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind memory scope policy server");
+    let app_addr = listener.local_addr().expect("memory scope policy address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{app_addr}");
+
+    let manual_global_project = client
+        .post(format!("{base}/api/memory/manual"))
+        .json(&json!({
+            "scope": "global",
+            "kind": "project_fact",
+            "fact": "Project fact must not be global.",
+            "confidence": 0.8,
+            "pinned": false
+        }))
+        .send()
+        .await
+        .expect("manual global project create");
+    assert_eq!(manual_global_project.status(), StatusCode::BAD_REQUEST);
+
+    let manual_global_project_decision = client
+        .post(format!("{base}/api/memory/manual"))
+        .json(&json!({
+            "scope": "global",
+            "kind": "project_decision",
+            "fact": "Project decision must not be global.",
+            "confidence": 0.8,
+            "pinned": false
+        }))
+        .send()
+        .await
+        .expect("manual global project decision create");
+    assert_eq!(
+        manual_global_project_decision.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let manual_global_preference = client
+        .post(format!("{base}/api/memory/manual"))
+        .json(&json!({
+            "scope": "global",
+            "kind": "preference",
+            "fact": "Global preference stays allowed.",
+            "confidence": 0.8,
+            "pinned": false
+        }))
+        .send()
+        .await
+        .expect("manual global preference create");
+    assert_eq!(manual_global_preference.status(), StatusCode::OK);
+
+    let promote = client
+        .post(format!("{base}/api/memory/promote"))
+        .json(&json!({
+            "scope": "workspace",
+            "workspaceId": workspace_id,
+            "memoryId": "fact-project-http",
+            "targetScope": "global"
+        }))
+        .send()
+        .await
+        .expect("promote workspace project to global");
+    assert_eq!(promote.status(), StatusCode::BAD_REQUEST);
+
+    let global_list = client
+        .get(format!(
+            "{base}/api/memory?scope=global&status=active&page=1&pageSize=20"
+        ))
+        .send()
+        .await
+        .expect("global memory list")
+        .json::<Value>()
+        .await
+        .expect("global memory list response");
+    assert_eq!(global_list["totalCount"], 1);
+    assert_eq!(global_list["memories"][0]["kind"], "preference");
+
+    let workspace_fact = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+        .expect("reopen workspace memory database")
+        .fact("fact-project-http")
+        .expect("workspace fact query")
+        .expect("workspace fact");
+    assert_eq!(workspace_fact.kind, "project_fact");
+    assert_eq!(workspace_fact.scope, "workspace");
 
     app_task.abort();
 }

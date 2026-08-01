@@ -5,7 +5,7 @@ use foco_store::{
     config::MemorySettings,
     memory::{
         MemoryDatabase, MemoryFactRecord, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus,
-        NewMemoryFact, NewMemorySource,
+        NewMemoryFact, NewMemorySource, ensure_memory_kind_scope_allowed,
     },
 };
 use foco_tools::output_budget::{
@@ -145,12 +145,12 @@ pub(crate) fn memory_tool_definitions() -> Vec<NeutralToolDefinition> {
                     "scope": {
                         "type": "string",
                         "enum": ["global", "workspace", "chat"],
-                        "description": "Memory storage scope."
+                        "description": "Memory storage scope. global accepts only user-wide preferences; project_fact and project_decision must use workspace."
                     },
                     "kind": {
                         "type": "string",
                         "enum": ["preference", "project_fact", "project_decision", "procedure", "constraint", "episode", "user_note"],
-                        "description": "Memory kind."
+                        "description": "Memory kind. project_fact and project_decision must not use global scope."
                     },
                     "fact": {
                         "type": "string",
@@ -533,6 +533,7 @@ pub(crate) fn execute_memory_write_tool(
     memory_tool_timeout_ms_from_input(input.timeout_ms)?;
     let scope = MemoryScope::parse(input.scope.trim()).map_err(ApiError::from_memory_error)?;
     let kind = MemoryKind::parse(input.kind.trim()).map_err(ApiError::from_memory_error)?;
+    ensure_memory_kind_scope_allowed(scope, kind).map_err(ApiError::from_memory_error)?;
     let fact = normalized_required_text("fact", &input.fact)?;
     let reason = normalized_optional_text(input.reason);
     let chat_id = (scope == MemoryScope::Chat).then_some(context.chat_id.as_str());
@@ -652,12 +653,12 @@ pub(crate) fn memory_extraction_tool_definition() -> NeutralToolDefinition {
                             "scope": {
                                 "type": "string",
                                 "enum": ["global", "workspace", "chat"],
-                                "description": "Suggested storage scope for the fact."
+                                "description": "Suggested storage scope for the fact. global is only for user-wide preferences; project_fact and project_decision must use workspace."
                             },
                             "kind": {
                                 "type": "string",
                                 "enum": ["preference", "project_fact", "project_decision", "procedure", "constraint", "episode"],
-                                "description": "Memory kind. Do not use user_note for automatic extraction."
+                                "description": "Memory kind. project_fact and project_decision must not use global scope. Do not use user_note for automatic extraction."
                             },
                             "fact": {
                                 "type": "string",

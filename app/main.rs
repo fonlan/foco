@@ -342,7 +342,7 @@ If the evidence merely repeats or adds another source for the same memory, submi
 Avoid extracting multiple facts in the same output that restate each other at different specificity levels. \
 Include a fact only when it is directly supported by one or more provided evidenceIds. \
 If there is nothing worth remembering, submit {\"facts\":[]}. \
-Suggested scopes mean: global for user-wide stable preferences, workspace for project-specific durable facts, chat for session-specific details.";
+Suggested scopes mean: global for user-wide stable preferences only, workspace for project-specific durable facts and decisions, chat for session-specific details. Never suggest global for project_fact or project_decision; project-class memories are always stored in the current workspace when global is suggested.";
 // Built-in System prompt for model-based memory retrieval.
 pub(crate) const DEFAULT_MEMORY_RETRIEVAL_SYSTEM_PROMPT: &str = "Select only Foco memory facts that are directly relevant to the user's current request. Use the select_relevant_memory tool exactly once. Do not return prose. Return factKeys in the order they should be injected. Include pinned facts only when relevant.";
 // Built-in System prompt for Memory Dream planner requests.
