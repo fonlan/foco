@@ -3256,6 +3256,93 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("wraps long memory facts inside the memory row button", async () => {
+    const longFact =
+      "这是一个用于验证记忆列表长文本换行的中文段落，它应该能在卡片可用宽度内自然折行。" +
+      "NoSpacesEnglishRunThatMustBreakAnywhere".repeat(8) +
+      " https://example.com/very/long/path/0123456789abcdef0123456789abcdef0123456789abcdef " +
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const longMemory = {
+      ...activeMemory,
+      fact: longFact,
+      id: "memory-long-text-1",
+    };
+    appTestState.memoryListAdditional = [longMemory];
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+    expect(await screen.findByText("Memory settings")).toBeInTheDocument();
+
+    // The full row stays a single clickable, focusable button that selects the memory.
+    const rowButton = screen.getByRole("button", {
+      name: (name) => name.includes("验证记忆列表长文本换行"),
+    });
+    expect(rowButton).toBeEnabled();
+    rowButton.focus();
+    expect(rowButton).toHaveFocus();
+
+    // The HeroUI Button defaults (whitespace-nowrap + fixed height) are lifted so
+    // long text can wrap inside the card column instead of overflowing it.
+    expect(rowButton).toHaveClass("whitespace-normal");
+    expect(rowButton).toHaveClass("h-auto");
+    expect(rowButton).toHaveClass("max-w-full");
+
+    // The fact text opts into wrapping unbreakable strings (overflow-wrap: anywhere).
+    const factDiv = rowButton.querySelector(".wrap-anywhere");
+    expect(factDiv).not.toBeNull();
+    expect(factDiv?.textContent).toContain("NoSpacesEnglishRunThatMustBreakAnywhere");
+    expect(factDiv?.textContent).toContain("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+    // The per-row enable switch and row actions remain present and usable.
+    const toggle = screen.getByRole("switch", {
+      name: `Disable memory ${longFact}`,
+    });
+    expect(toggle).toBeEnabled();
+    const editButtons = screen.getAllByRole("button", { name: "Edit memory" });
+    expect(editButtons.length).toBeGreaterThan(0);
+    expect(editButtons.every((button) => (button as HTMLButtonElement).disabled === false)).toBe(true);
+    const deleteButtons = screen.getAllByRole("button", { name: "Delete memory" });
+    expect(deleteButtons.length).toBeGreaterThan(0);
+    expect(deleteButtons.every((button) => (button as HTMLButtonElement).disabled === false)).toBe(true);
+  });
+
+  it("uses explicit desktop max-width overrides for the memory dialogs", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+    expect(await screen.findByText("Memory settings")).toBeInTheDocument();
+
+    // Create mode keeps the compact ~34rem width with an explicit max-width so
+    // HeroUI's size="sm" max-w-sm cannot shrink it further.
+    await userEvent.click(screen.getByRole("button", { name: "Create memory" }));
+    const createDialog = await screen.findByRole("dialog", { name: "Create memory" });
+    expect(createDialog).toHaveClass("w-[min(92vw,34rem)]");
+    expect(createDialog).toHaveClass("max-w-[min(92vw,34rem)]");
+    expect(createDialog).not.toHaveClass("fixed");
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Create memory" })).not.toBeInTheDocument();
+    });
+
+    // Edit mode explicitly overrides HeroUI's size="lg" max-w-lg with a wide
+    // desktop max-width (~72rem) while remaining responsive on narrow screens.
+    await userEvent.click(screen.getAllByRole("button", { name: "Edit memory" })[0]);
+    const editDialog = await screen.findByRole("dialog", { name: "Edit memory" });
+    expect(editDialog).toHaveClass("w-[min(94vw,72rem)]");
+    expect(editDialog).toHaveClass("max-w-[min(94vw,72rem)]");
+    expect(editDialog).not.toHaveClass("fixed");
+    expect(within(editDialog).getByText("Memory details")).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "Edit memory" })).not.toBeInTheDocument();
+    });
+  });
+
   it("toggles memory enabled state per row without changing pin or list membership", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

@@ -7375,7 +7375,7 @@ export function SettingsPanel({
                         ? t("Create memory")
                         : t("Edit memory")
                     }
-                    className={`fixed left-1/2 top-1/2 z-50 max-h-[88vh] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)] ${memoryDialogMode === "edit" ? "w-[min(94vw,72rem)]" : "w-[min(92vw,34rem)]"
+                    className={`max-h-[88vh] overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)] ${memoryDialogMode === "edit" ? "w-[min(94vw,72rem)] max-w-[min(94vw,72rem)]" : "w-[min(92vw,34rem)] max-w-[min(92vw,34rem)]"
                       }`}
                   >
                   <form onSubmit={(event) => void saveMemoryDialog(event)}>
@@ -8860,7 +8860,7 @@ export function SettingsPanel({
                         key={memory.id}
                       >
                         <SettingsButton
-                          className="settings-list-select-button flex w-full min-w-0 flex-col items-stretch justify-center gap-0 text-left"
+                          className="settings-list-select-button flex h-auto w-full min-w-0 max-w-full flex-col items-stretch justify-center gap-0 whitespace-normal text-left"
                           onClick={() => setSelectedMemoryId(memory.id)}
                           type="button"
                         >
@@ -8881,7 +8881,7 @@ export function SettingsPanel({
                               </span>
                             ) : null}
                           </div>
-                          <div className="mt-2 break-words text-sm font-semibold text-[var(--foreground)]">
+                          <div className="mt-2 wrap-anywhere text-sm font-semibold text-[var(--foreground)]">
                             {memory.fact}
                           </div>
                           <div className="mt-2 text-xs text-[var(--muted)]">
