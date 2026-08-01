@@ -110,6 +110,102 @@ describe("durable Complete final text", () => {
       ),
     ).toEqual(parts);
   });
+
+  it("treats an explicit final segment as replaceable when the companion flag is absent", () => {
+    const parts: ChatMessagePart[] = [
+      { text: "Before tool. ", type: "text" },
+      toolPart,
+      { text: "Draft conclusion.", type: "text" },
+      {
+        type: "agentTaskLifecycle",
+        lifecycle: {
+          completedAt: "2026-08-01T03:00:01Z",
+          durationMs: 1000,
+          errorPreview: null,
+          eventId: "lifecycle-1",
+          instanceId: "agent-1",
+          parentTaskId: "parent-1",
+          resultJson: null,
+          resultPreview: "Completed.",
+          startedAt: "2026-08-01T03:00:00Z",
+          status: "completed",
+          taskId: "task-1",
+          teamId: "team-1",
+        },
+      },
+      {
+        type: "contextCompression",
+        id: "compression-1",
+        kind: "llm",
+        status: "completed",
+        detail: { compressionId: "compression-1", snapshotId: "snapshot-1" },
+      },
+      {
+        type: "userInterruption",
+        id: "guidance-1",
+        content: "Continue from the tool result.",
+        source: "toolCallLoopGuard",
+      },
+    ];
+    const event: Extract<ChatStreamEvent, { type: "complete" }> = {
+      assistantMessageId: "assistant-1",
+      chatId: "chat-1",
+      finalTextSegment: "Final conclusion.",
+      memoriesUsed: [],
+      metrics: {
+        firstTokenLatencyMs: null,
+        llmRequestIds: [],
+        modelId: "model-1",
+        outputTokens: null,
+        providerId: "provider-1",
+        totalLatencyMs: null,
+      },
+      text: "Final conclusion.",
+      type: "complete",
+    };
+
+    const expected: ChatMessagePart[] = [
+      { text: "Before tool. ", type: "text" },
+      toolPart,
+      { text: "Final conclusion.", type: "text" },
+      parts[3],
+      parts[4],
+      parts[5],
+    ];
+    const completedOnce = finalizedTextParts(
+      parts,
+      "Before tool. Draft conclusion.",
+      event,
+    );
+
+    expect(completedOnce).toEqual(expected);
+    expect(
+      finalizedTextParts(completedOnce, "Before tool. Final conclusion.", event),
+    ).toEqual(expected);
+  });
+
+  it("keeps the legacy Complete fallback when neither final-segment field is present", () => {
+    const parts: ChatMessagePart[] = [{ text: "Earlier text. ", type: "text" }];
+    const event: Extract<ChatStreamEvent, { type: "complete" }> = {
+      assistantMessageId: "assistant-1",
+      chatId: "chat-1",
+      memoriesUsed: [],
+      metrics: {
+        firstTokenLatencyMs: null,
+        llmRequestIds: [],
+        modelId: "model-1",
+        outputTokens: null,
+        providerId: "provider-1",
+        totalLatencyMs: null,
+      },
+      text: "Earlier text. Legacy conclusion.",
+      type: "complete",
+    };
+
+    expect(finalizedTextParts(parts, "Earlier text. ", event)).toEqual([
+      { text: "Earlier text. Legacy conclusion.", type: "text" },
+    ]);
+  });
 });
 
 describe("remote start run identity", () => {

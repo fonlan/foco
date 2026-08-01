@@ -10698,6 +10698,167 @@ fn finalized_assistant_parts_replace_only_the_durable_final_text_segment() {
 }
 
 #[test]
+fn finalized_assistant_parts_replace_a_final_segment_before_later_structural_parts() {
+    let tool_call = ChatToolCallSummary {
+        id: "tool-1".to_string(),
+        name: "read_file".to_string(),
+        status: "completed".to_string(),
+        input: json!({ "path": "README.md" }),
+        output: None,
+        is_error: false,
+        started_at: None,
+        completed_at: None,
+        live_output: None,
+    };
+    let structural_events = [
+        (
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Before tool. " }),
+        ),
+        (
+            "tool_call",
+            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-1" } }),
+        ),
+        (
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Draft conclusion." }),
+        ),
+        (
+            "agent_task_lifecycle",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "lifecycle": {
+                    "eventId": "lifecycle-1",
+                    "teamId": "team-1",
+                    "taskId": "task-1",
+                    "parentTaskId": "parent-1",
+                    "instanceId": "agent-1",
+                    "status": "completed",
+                    "startedAt": "2026-08-01T03:00:00Z",
+                    "completedAt": "2026-08-01T03:00:01Z",
+                    "durationMs": 1000,
+                    "resultPreview": "Completed.",
+                    "errorPreview": null,
+                }
+            }),
+        ),
+        (
+            "context_compression",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "type": "contextCompression",
+                "kind": "llm",
+                "status": "completed",
+                "snapshotId": "snapshot-1",
+                "detail": {
+                    "status": "completed",
+                    "kind": "llm",
+                    "compressionId": "compression-1",
+                    "snapshotId": "snapshot-1",
+                    "startedAt": "2026-08-01T03:00:00Z",
+                    "completedAt": "2026-08-01T03:00:01Z",
+                    "providerId": "provider-1",
+                    "modelId": "model-1",
+                }
+            }),
+        ),
+        (
+            "guidance_applied",
+            json!({
+                "interruptedAssistantId": "assistant-1",
+                "id": "guidance-1",
+                "content": "Continue from the tool result.",
+                "source": "toolCallLoopGuard",
+            }),
+        ),
+    ];
+
+    for (completion, label) in [
+        (
+            json!({
+                "assistantMessageId": "assistant-1",
+                "hasFinalTextSegment": true,
+                "finalTextSegment": "Final conclusion.",
+            }),
+            "explicit final-segment flag",
+        ),
+        (
+            json!({
+                "assistantMessageId": "assistant-1",
+                "finalTextSegment": "Final conclusion.",
+            }),
+            "implicit final-segment flag",
+        ),
+    ] {
+        let events = structural_events
+            .iter()
+            .cloned()
+            .chain(std::iter::once(("completion", completion)))
+            .map(|(event_type, value)| CapturedAuditEvent {
+                event_at: "2026-08-01T03:00:00Z".to_string(),
+                event_type: event_type.to_string(),
+                normalized_event_json: value.to_string(),
+            })
+            .collect::<Vec<_>>();
+
+        let parts = finalized_assistant_message_parts(
+            "assistant-1",
+            &events,
+            "Before tool. Final conclusion.",
+            None,
+            std::slice::from_ref(&tool_call),
+            None,
+        )
+        .expect("stored parts");
+
+        assert!(
+            matches!(
+                parts.as_slice(),
+                [
+                    StoredChatMessagePart::Text { text },
+                    StoredChatMessagePart::ToolCall { tool_call_id },
+                    StoredChatMessagePart::Text { text: final_text },
+                    StoredChatMessagePart::AgentTaskLifecycle { lifecycle },
+                    StoredChatMessagePart::ContextCompression { id, .. },
+                    StoredChatMessagePart::UserInterruption { id: guidance_id, .. },
+                ]
+                    if text == "Before tool. "
+                        && tool_call_id == "tool-1"
+                        && final_text == "Final conclusion."
+                        && lifecycle.event_id == "lifecycle-1"
+                        && id == "compression-1"
+                        && guidance_id == "guidance-1"
+            ),
+            "{label}",
+        );
+    }
+}
+
+#[test]
+fn finalized_assistant_parts_keep_legacy_completion_without_segment_fields() {
+    let events = [CapturedAuditEvent {
+        event_at: "2026-08-01T03:00:00Z".to_string(),
+        event_type: "completion".to_string(),
+        normalized_event_json: json!({ "assistantMessageId": "assistant-1" }).to_string(),
+    }];
+
+    let parts = finalized_assistant_message_parts(
+        "assistant-1",
+        &events,
+        "Legacy conclusion.",
+        None,
+        &[],
+        None,
+    )
+    .expect("stored parts");
+
+    assert!(matches!(
+        parts.as_slice(),
+        [StoredChatMessagePart::Text { text }] if text == "Legacy conclusion."
+    ));
+}
+
+#[test]
 fn finalized_assistant_parts_append_final_text_after_a_tool_missing_from_events() {
     let first_tool_call = ChatToolCallSummary {
         id: "tool-1".to_string(),

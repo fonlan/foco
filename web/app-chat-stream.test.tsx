@@ -367,6 +367,65 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("merges an already-canonical final segment with a stable lifecycle", () => {
+    const lifecycle: ChatMessagePart = {
+      type: "agentTaskLifecycle",
+      lifecycle: {
+        completedAt: "2026-08-01T03:00:01Z",
+        durationMs: 1000,
+        errorPreview: null,
+        eventId: "lifecycle-1",
+        instanceId: "agent-1",
+        parentTaskId: "parent-1",
+        resultJson: null,
+        resultPreview: "Completed.",
+        startedAt: "2026-08-01T03:00:00Z",
+        status: "completed",
+        taskId: "task-1",
+        teamId: "team-1",
+      },
+    };
+    const normalized = canonicalizeAssistantMessage(
+      [
+        assistantAlias(
+          "local-complete",
+          [
+            { type: "text", text: "Before tool. " },
+            toolPart("completed"),
+            { type: "text", text: "Final conclusion." },
+            lifecycle,
+          ],
+          undefined,
+        ),
+        assistantAlias(
+          "durable-history",
+          [
+            { type: "text", text: "Before tool. " },
+            toolPart("completed"),
+            { type: "text", text: "Final conclusion." },
+            lifecycle,
+          ],
+          undefined,
+        ),
+      ],
+      "durable-history",
+      ["local-complete"],
+    );
+
+    expect(normalized).toHaveLength(1);
+    expect(
+      normalized[0]?.parts.filter(
+        (part) => part.type === "text" && part.text === "Final conclusion.",
+      ),
+    ).toHaveLength(1);
+    expect(normalized[0]?.parts.map((part) => part.type)).toEqual([
+      "text",
+      "toolCall",
+      "text",
+      "agentTaskLifecycle",
+    ]);
+  });
+
   it("merges legacy unkeyed part variants only when content proves continuity", () => {
     const cases: Array<{
       name: string;
@@ -5502,6 +5561,146 @@ describe("app-chat-stream verification surfaces", () => {
     expect(finalRow).toHaveTextContent("Durable final reasoning.");
     expect(within(finalRow as HTMLElement).queryByText("streaming")).toBeNull();
 
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream")?.close();
+    });
+  });
+
+  it("does not duplicate the final conclusion when durable parts load after Complete", async () => {
+    const delayedMessages = deferred<Response>();
+    const assistantMessageId = "message-assistant-final-segment";
+    let messagesRequestCount = 0;
+    const lifecycle = {
+      completedAt: "2026-08-01T03:00:01Z",
+      durationMs: 1000,
+      errorPreview: null,
+      eventId: "lifecycle-final-segment",
+      instanceId: "agent-1",
+      parentTaskId: "parent-1",
+      resultJson: null,
+      resultPreview: "Completed.",
+      startedAt: "2026-08-01T03:00:00Z",
+      status: "completed" as const,
+      taskId: "task-1",
+      teamId: "team-1",
+    };
+    const streamingMessagesPayload = {
+      messages: [
+        chatMessages.messages[0],
+        {
+          ...chatMessages.messages[1],
+          content: "",
+          id: assistantMessageId,
+          metrics: null,
+          parts: [],
+          reasoning: null,
+          status: "streaming",
+          toolCalls: [],
+        },
+      ],
+      activeRun: {
+        assistantMessageId,
+        chatId: "chat-1",
+        lastSequence: 0,
+        runId: "request-stream",
+        workspaceId: "workspace-1",
+      },
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          messagesRequestCount += 1;
+          return messagesRequestCount === 1
+            ? jsonResponse(streamingMessagesPayload)
+            : delayedMessages.promise;
+        }
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() =>
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
+    );
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "temporary-final-segment-alias",
+        delta: "trigger durable history reload",
+        type: "textDelta",
+      });
+    });
+    await waitFor(() => expect(messagesRequestCount).toBe(2));
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId,
+        delta: "Draft conclusion.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId,
+        lifecycle,
+        type: "agentTaskLifecycle",
+      });
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId,
+        chatId: "chat-1",
+        finalTextSegment: "Final conclusion.",
+        hasFinalTextSegment: true,
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 3,
+          providerId: "provider-1",
+          totalLatencyMs: 100,
+        },
+        text: "Final conclusion.",
+        type: "complete",
+      });
+    });
+    await screen.findByText("Final conclusion.");
+
+    await act(async () => {
+      delayedMessages.resolve(
+        jsonResponse({
+          activeRun: null,
+          messages: [
+            chatMessages.messages[0],
+            {
+              ...chatMessages.messages[1],
+              content: "Final conclusion.",
+              id: assistantMessageId,
+              metrics: null,
+              parts: [
+                { text: "Draft conclusion.", type: "text" },
+                { lifecycle, type: "agentTaskLifecycle" },
+                { text: "Final conclusion.", type: "text" },
+              ],
+              reasoning: null,
+              status: undefined,
+              toolCalls: [],
+            },
+          ],
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText("Final conclusion.")).toHaveLength(1);
+      expect(screen.queryAllByText("Draft conclusion.")).toHaveLength(0);
+      expect(
+        screen.getByLabelText("Subagent result: Unknown agent (Completed)"),
+      ).toBeInTheDocument();
+    });
     await act(async () => {
       appTestState.chatStreamControllers.get("request-stream")?.close();
     });
