@@ -1016,6 +1016,8 @@ fn initialize_code_graph_execution_root(execution_root: &Path) -> AppResult<Code
     let report = index_workspace(execution_root)?;
     tracing::info!(
         execution_root = %execution_root.display(),
+        index_scope = "full_workspace",
+        index_reason = "initialization",
         scanned_files = report.scanned_files,
         indexed_files = report.indexed_files,
         unchanged_files = report.unchanged_files,
@@ -1032,6 +1034,9 @@ fn initialize_code_graph_execution_root(execution_root: &Path) -> AppResult<Code
     let watcher = start_code_graph_watcher(execution_root)?;
     tracing::info!(
         execution_root = %execution_root.display(),
+        watcher_idle_receive_timeout_ms = 100_u64,
+        watch_event_queue = "std_mpsc_unbounded",
+        watch_event_queue_overflow_observable = false,
         elapsed_ms = watcher_started_at.elapsed().as_millis() as u64,
         "started code graph filesystem watcher"
     );

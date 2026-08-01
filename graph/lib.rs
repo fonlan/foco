@@ -17,6 +17,90 @@ mod resolver;
 mod tests;
 
 const DEFAULT_WATCH_DEBOUNCE: Duration = Duration::from_millis(750);
+const WATCHER_IDLE_RECEIVE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Counters emitted at bounded watcher lifecycle points rather than once per
+/// filesystem event. They deliberately contain no event paths or payloads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WatcherDiagnosticCounters {
+    receive_timeouts: u64,
+    events_received: u64,
+    relevant_events: u64,
+    filtered_events: u64,
+    event_errors: u64,
+    debounce_resets: u64,
+    refreshes: u64,
+}
+
+impl WatcherDiagnosticCounters {
+    fn record_event(&mut self, relevant: bool) {
+        self.events_received = self.events_received.saturating_add(1);
+        if relevant {
+            self.relevant_events = self.relevant_events.saturating_add(1);
+        } else {
+            self.filtered_events = self.filtered_events.saturating_add(1);
+        }
+    }
+
+    fn record_receive_timeout(&mut self) {
+        self.receive_timeouts = self.receive_timeouts.saturating_add(1);
+    }
+
+    fn record_event_error(&mut self) {
+        self.event_errors = self.event_errors.saturating_add(1);
+    }
+
+    fn record_debounce_reset(&mut self) {
+        self.debounce_resets = self.debounce_resets.saturating_add(1);
+    }
+
+    fn record_refresh(&mut self) {
+        self.refreshes = self.refreshes.saturating_add(1);
+    }
+}
+
+struct WatcherDiagnostics {
+    started_at: Instant,
+    total: WatcherDiagnosticCounters,
+    since_last_refresh: WatcherDiagnosticCounters,
+}
+
+impl WatcherDiagnostics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            total: WatcherDiagnosticCounters::default(),
+            since_last_refresh: WatcherDiagnosticCounters::default(),
+        }
+    }
+
+    fn record_event(&mut self, relevant: bool) {
+        self.total.record_event(relevant);
+        self.since_last_refresh.record_event(relevant);
+    }
+
+    fn record_receive_timeout(&mut self) {
+        self.total.record_receive_timeout();
+        self.since_last_refresh.record_receive_timeout();
+    }
+
+    fn record_event_error(&mut self) {
+        self.total.record_event_error();
+        self.since_last_refresh.record_event_error();
+    }
+
+    fn record_debounce_reset(&mut self) {
+        self.total.record_debounce_reset();
+        self.since_last_refresh.record_debounce_reset();
+    }
+
+    fn take_refresh_window(&mut self) -> WatcherDiagnosticCounters {
+        self.total.record_refresh();
+        let mut window = std::mem::take(&mut self.since_last_refresh);
+        window.record_refresh();
+        window
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IndexReport {
@@ -64,47 +148,99 @@ pub fn start_code_graph_watcher_with_debounce(
         let _watcher = watcher;
         let mut pending = false;
         let mut next_index_at = Instant::now();
+        let mut diagnostics = WatcherDiagnostics::new();
 
         loop {
             if stop_rx.try_recv().is_ok() {
                 break;
             }
 
-            match event_rx.recv_timeout(Duration::from_millis(100)) {
+            match event_rx.recv_timeout(WATCHER_IDLE_RECEIVE_TIMEOUT) {
                 Ok(Ok(event)) => {
-                    if event.paths.iter().any(|path| {
+                    let relevant = event.paths.iter().any(|path| {
                         indexing::should_consider_watch_path(&worker_workspace_path, path)
-                    }) {
+                    });
+                    diagnostics.record_event(relevant);
+                    if relevant {
                         pending = true;
                         next_index_at = Instant::now() + debounce;
+                        diagnostics.record_debounce_reset();
                     }
                 }
                 Ok(Err(error)) => {
+                    diagnostics.record_event_error();
                     tracing::warn!(workspace = %worker_workspace_path.display(), error = %error, "code graph watcher event failed");
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Timeout) => diagnostics.record_receive_timeout(),
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
             if pending && Instant::now() >= next_index_at {
+                let window = diagnostics.take_refresh_window();
                 match index_workspace(&worker_workspace_path) {
                     Ok(report) => {
                         tracing::info!(
                             workspace = %worker_workspace_path.display(),
+                            index_scope = "full_workspace",
+                            index_reason = "watcher_debounced_relevant_event",
+                            watch_event_queue = "std_mpsc_unbounded",
+                            watch_event_queue_overflow_observable = false,
+                            watcher_receive_timeouts = window.receive_timeouts,
+                            watcher_events_received = window.events_received,
+                            watcher_relevant_events = window.relevant_events,
+                            watcher_filtered_events = window.filtered_events,
+                            watcher_event_errors = window.event_errors,
+                            watcher_debounce_resets = window.debounce_resets,
+                            watcher_refreshes = window.refreshes,
+                            scanned_files = report.scanned_files,
                             indexed_files = report.indexed_files,
                             unchanged_files = report.unchanged_files,
+                            skipped_files = report.skipped_files,
                             deleted_files = report.deleted_files,
                             parse_errors = report.parse_errors,
+                            file_prepare_duration_us = report.file_prepare_duration_us,
+                            sqlite_persistence_duration_us = report.sqlite_persistence_duration_us,
+                            resolver_duration_us = report.resolver_duration_us,
                             "code graph watcher refreshed workspace index"
                         );
                     }
                     Err(error) => {
-                        tracing::error!(workspace = %worker_workspace_path.display(), error = %error, "code graph watcher refresh failed");
+                        tracing::error!(
+                            workspace = %worker_workspace_path.display(),
+                            index_scope = "full_workspace",
+                            index_reason = "watcher_debounced_relevant_event",
+                            watch_event_queue = "std_mpsc_unbounded",
+                            watch_event_queue_overflow_observable = false,
+                            watcher_receive_timeouts = window.receive_timeouts,
+                            watcher_events_received = window.events_received,
+                            watcher_relevant_events = window.relevant_events,
+                            watcher_filtered_events = window.filtered_events,
+                            watcher_event_errors = window.event_errors,
+                            watcher_debounce_resets = window.debounce_resets,
+                            watcher_refreshes = window.refreshes,
+                            error = %error,
+                            "code graph watcher refresh failed"
+                        );
                     }
                 }
                 pending = false;
             }
         }
+
+        tracing::info!(
+            workspace = %worker_workspace_path.display(),
+            watcher_lifetime_ms = diagnostics.started_at.elapsed().as_millis() as u64,
+            watch_event_queue = "std_mpsc_unbounded",
+            watch_event_queue_overflow_observable = false,
+            watcher_receive_timeouts = diagnostics.total.receive_timeouts,
+            watcher_events_received = diagnostics.total.events_received,
+            watcher_relevant_events = diagnostics.total.relevant_events,
+            watcher_filtered_events = diagnostics.total.filtered_events,
+            watcher_event_errors = diagnostics.total.event_errors,
+            watcher_debounce_resets = diagnostics.total.debounce_resets,
+            watcher_refreshes = diagnostics.total.refreshes,
+            "code graph watcher stopped"
+        );
     });
 
     Ok(CodeGraphWatcher {

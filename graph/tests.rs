@@ -8,6 +8,7 @@ use std::{
 use rusqlite::Connection;
 
 use crate::{
+    WatcherDiagnostics,
     extractors::{
         LanguageKind, extract_file,
         facts::{
@@ -16,6 +17,39 @@ use crate::{
     },
     index_workspace,
 };
+
+#[test]
+fn watcher_diagnostics_tracks_only_counts_without_event_payloads() {
+    let mut diagnostics = WatcherDiagnostics::new();
+    diagnostics.record_event(true);
+    diagnostics.record_event(false);
+    diagnostics.record_receive_timeout();
+    diagnostics.record_event_error();
+    diagnostics.record_debounce_reset();
+
+    let refresh_window = diagnostics.take_refresh_window();
+
+    assert_eq!(
+        refresh_window,
+        crate::WatcherDiagnosticCounters {
+            receive_timeouts: 1,
+            events_received: 2,
+            relevant_events: 1,
+            filtered_events: 1,
+            event_errors: 1,
+            debounce_resets: 1,
+            refreshes: 1,
+        }
+    );
+    assert_eq!(diagnostics.total, refresh_window);
+    assert_eq!(
+        diagnostics.take_refresh_window(),
+        crate::WatcherDiagnosticCounters {
+            refreshes: 1,
+            ..Default::default()
+        }
+    );
+}
 
 #[test]
 fn extraction_facts_are_owned_and_use_stable_local_keys() {
