@@ -631,6 +631,12 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Queued: "队列中",
     Send: "发送",
     "Context usage": "上下文使用量",
+    "Context usage refresh failed: {error}": "上下文使用量刷新失败：{error}",
+    "Diagnostic reference: {diagnosticId}": "诊断引用：{diagnosticId}",
+    "Diagnostic reference {diagnosticId}; operation {operation}; phase {phase}":
+      "诊断引用 {diagnosticId}；操作 {operation}；阶段 {phase}",
+    "Copy diagnostic reference": "复制诊断引用",
+    Unavailable: "不可用",
     "Context usage {percent}%": "上下文使用量 {percent}%",
     "Context usage {percent}% (assembled {assembledPercent}%)":
       "上下文使用量 {percent}%（未裁剪组装量 {assembledPercent}%）",

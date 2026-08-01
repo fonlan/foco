@@ -296,9 +296,12 @@ const SettingsPanel = lazy(() =>
   })),
 );
 import {
+  errorDiagnostic,
   errorMessage,
   requestJson,
+  responseError,
   responseErrorMessage,
+  type ApiDiagnostic,
 } from "./shared/api-client";
 import { installUpdateAndWaitForRestart } from "./shared/update-install";
 import { fetchWorkspaceSpecJobsList } from "./shared/workspace-spec-jobs-list";
@@ -2242,7 +2245,20 @@ export function App() {
   const [ripgrepInstallError, setRipgrepInstallError] = useState<string | null>(
     null,
   );
-  const [error, setError] = useState<string | null>(null);
+  const [error, setErrorState] = useState<string | null>(null);
+  const [errorDiagnosticReference, setErrorDiagnosticReference] =
+    useState<ApiDiagnostic | null>(null);
+  const [contextUsageErrorByChatKey, setContextUsageErrorByChatKey] = useState<
+    Record<string, { diagnostic: ApiDiagnostic | null; message: string }>
+  >({});
+  const setError = useCallback((message: string | null) => {
+    setErrorState(message);
+    setErrorDiagnosticReference(null);
+  }, []);
+  const setRunError = useCallback((requestError: unknown) => {
+    setErrorState(errorMessage(requestError));
+    setErrorDiagnosticReference(errorDiagnostic(requestError));
+  }, []);
   const activeRunAbortByChatKeyRef = useRef<Map<string, AbortController>>(
     new Map(),
   );
@@ -2491,6 +2507,9 @@ export function App() {
       : null;
   const contextUsage = activeContextUsageKey
     ? (contextUsageByChatKey[activeContextUsageKey] ?? null)
+    : null;
+  const contextUsageError = activeContextUsageKey
+    ? (contextUsageErrorByChatKey[activeContextUsageKey] ?? null)
     : null;
   const liveChatStatistics = activeChatKey
     ? (liveChatStatisticsByKey[activeChatKey] ?? null)
@@ -6807,6 +6826,14 @@ export function App() {
       const { [fromChatKey]: movedLoading, ...next } = current;
       return { ...next, [toChatKey]: movedLoading };
     });
+    setContextUsageErrorByChatKey((current) => {
+      if (!(fromChatKey in current)) {
+        return current;
+      }
+
+      const { [fromChatKey]: movedError, ...next } = current;
+      return { ...next, [toChatKey]: movedError };
+    });
 
     const abortController =
       contextUsageAbortByChatKeyRef.current.get(fromChatKey);
@@ -6840,6 +6867,13 @@ export function App() {
       ...current,
       [chatKey]: false,
     }));
+    setContextUsageErrorByChatKey((current) => {
+      if (!(chatKey in current)) {
+        return current;
+      }
+      const { [chatKey]: _removed, ...next } = current;
+      return next;
+    });
   }
 
   function removeContextUsageForChatKey(chatKey: string) {
@@ -6855,6 +6889,14 @@ export function App() {
       return next;
     });
     setContextUsageLoadingByChatKey((current) => {
+      if (!(chatKey in current)) {
+        return current;
+      }
+
+      const { [chatKey]: _removed, ...next } = current;
+      return next;
+    });
+    setContextUsageErrorByChatKey((current) => {
       if (!(chatKey in current)) {
         return current;
       }
@@ -8112,7 +8154,7 @@ export function App() {
           isCurrentChatStreamSession(chatKey, expectedStreamSession)) &&
         !isAbortError(requestError)
       ) {
-        setError(errorMessage(requestError));
+        setRunError(requestError);
       }
     } finally {
       if (loadingChatControllersRef.current.get(chatKey) === controller) {
@@ -8179,7 +8221,7 @@ export function App() {
       }
     } catch (requestError) {
       if (activeChatKeyRef.current === chatKey) {
-        setError(errorMessage(requestError));
+        setRunError(requestError);
       }
     } finally {
       loadingOlderChatMessageKeysRef.current.delete(chatKey);
@@ -9988,6 +10030,14 @@ export function App() {
     }
   }
 
+  async function copyDiagnosticReference(diagnosticId: string) {
+    try {
+      await navigator.clipboard.writeText(diagnosticId);
+    } catch (copyError) {
+      setError(errorMessage(copyError));
+    }
+  }
+
   function workspaceFileDownloadUrl(workspaceId: string, path: string) {
     return `/api/workspaces/${encodeURIComponent(workspaceId)}/files/download?path=${encodeURIComponent(path)}`;
   }
@@ -11165,6 +11215,13 @@ export function App() {
     contextUsageAbortByChatKeyRef.current.get(chatKey)?.abort();
     const abortController = new AbortController();
     contextUsageAbortByChatKeyRef.current.set(chatKey, abortController);
+    setContextUsageErrorByChatKey((current) => {
+      if (!(chatKey in current)) {
+        return current;
+      }
+      const { [chatKey]: _removed, ...next } = current;
+      return next;
+    });
     deferStreamAuxiliaryUpdate(() => {
       setContextUsageLoadingByChatKey((current) => ({
         ...current,
@@ -11210,6 +11267,14 @@ export function App() {
               providerId: request.providerId,
             },
           }));
+          setContextUsageErrorByChatKey((current) => {
+            if (!(chatKey in current)) {
+              return current;
+            }
+            const next = { ...current };
+            delete next[chatKey];
+            return next;
+          });
         });
       }
     } catch (requestError) {
@@ -11218,9 +11283,16 @@ export function App() {
         requestError.name === "AbortError";
       if (
         !wasCancelled &&
-        contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId
+        contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId &&
+        activeChatKeyRef.current === chatKey
       ) {
-        setError(errorMessage(requestError));
+        setContextUsageErrorByChatKey((current) => ({
+          ...current,
+          [chatKey]: {
+            diagnostic: errorDiagnostic(requestError),
+            message: errorMessage(requestError),
+          },
+        }));
       }
     } finally {
       if (
@@ -11838,7 +11910,8 @@ export function App() {
         },
       );
       if (!response.ok) {
-        const message = await responseErrorMessage(response);
+        const backendError = await responseError(response);
+        const message = backendError.message;
         if (
           (response.status === 400 || response.status === 404) &&
           isStaleActiveRunError(message)
@@ -11874,7 +11947,7 @@ export function App() {
             workspaceId: activeRun.workspaceId,
           },
         );
-        throw new Error(message);
+        throw backendError;
       }
 
       const termination = await readChatStream(
@@ -12609,7 +12682,7 @@ export function App() {
           workspaceId: activeRun.workspaceId,
         });
         setChatRunFailed(chatKey, true);
-        setError(errorMessage(requestError));
+        setRunError(requestError);
       }
     } finally {
       if (!ownsSession()) {
@@ -13148,7 +13221,7 @@ export function App() {
       );
 
       if (!response.ok) {
-        throw new Error(await responseErrorMessage(response));
+        throw await responseError(response);
       }
 
       const termination = await readChatStream(response, (streamEvent) => {
@@ -13968,7 +14041,11 @@ export function App() {
       if (!wasCancelled) {
         setChatRunFailed(runMessagesKey, true);
       }
-      setError(message);
+      if (wasCancelled) {
+        setError(message);
+      } else {
+        setRunError(requestError);
+      }
       setPendingQuestion(null);
       setQuestionError(null);
       setIsAnsweringQuestion(false);
@@ -14703,7 +14780,43 @@ export function App() {
             role="alert"
           >
             <CircleAlert aria-hidden="true" className="app-error-toast-icon" />
-            <div className="app-error-toast-message">{error}</div>
+            <div className="app-error-toast-message">
+              <div>{error}</div>
+              {errorDiagnosticReference ? (
+                <div
+                  aria-label={t(
+                    "Diagnostic reference {diagnosticId}; operation {operation}; phase {phase}",
+                    {
+                      diagnosticId: errorDiagnosticReference.diagnosticId,
+                      operation:
+                        errorDiagnosticReference.operation ?? t("Unavailable"),
+                      phase: errorDiagnosticReference.phase ?? t("Unavailable"),
+                    },
+                  )}
+                  className="mt-2 flex flex-wrap items-center gap-1.5 text-[11px] font-medium"
+                >
+                  <span className="font-mono">
+                    {t("Diagnostic reference: {diagnosticId}", {
+                      diagnosticId: errorDiagnosticReference.diagnosticId,
+                    })}
+                  </span>
+                  <Button
+                    aria-label={t("Copy diagnostic reference")}
+                    className="h-5 min-h-5 px-1 text-[11px]"
+                    onPress={() =>
+                      void copyDiagnosticReference(
+                        errorDiagnosticReference.diagnosticId,
+                      )
+                    }
+                    size="sm"
+                    type="button"
+                    variant="ghost"
+                  >
+                    <Copy aria-hidden="true" className="size-3" />
+                  </Button>
+                </div>
+              ) : null}
+            </div>
             <Button
               aria-label={t("Close error message")}
               className="app-error-toast-close"
@@ -15727,6 +15840,8 @@ export function App() {
                   draftUnsupportedAttachmentMessage={
                     unsupportedDraftAttachmentMessage
                   }
+                  contextUsageDiagnostic={contextUsageError?.diagnostic ?? null}
+                  contextUsageError={contextUsageError?.message ?? null}
                   contextUsage={displayedContextUsage}
                   isLoadingSettings={isLoadingSettings}
                   isLoadingContextUsage={isLoadingContextUsage}
@@ -15763,6 +15878,9 @@ export function App() {
                   onSelectAttachments={handleSelectDraftAttachmentsForChatPanel}
                   onSelectEditAttachments={handleSelectEditAttachments}
                   onCancelRun={handleCancelRunForChatPanel}
+                  onCopyDiagnosticReference={(diagnosticId) =>
+                    void copyDiagnosticReference(diagnosticId)
+                  }
                   onGuideActiveRun={handleGuideActiveRunForChatPanel}
                   onQueueActiveRun={handleQueueActiveRunForChatPanel}
                   onModelChange={handleModelChangeForChatPanel}

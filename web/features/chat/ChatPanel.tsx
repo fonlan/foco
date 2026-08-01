@@ -210,6 +210,8 @@ function ChatPanelComponent({
   chatScrollKey,
   canGuideActiveRun,
   canRetryRun,
+  contextUsageDiagnostic,
+  contextUsageError,
   contextUsage,
   draftAttachments,
   draftMessage,
@@ -231,6 +233,7 @@ function ChatPanelComponent({
   onAddPastedImageAttachments,
   overviewRenderer,
   onCancelRun,
+  onCopyDiagnosticReference,
   onDraftMessageChange,
   onEditMessage,
   onGuideActiveRun,
@@ -268,6 +271,12 @@ function ChatPanelComponent({
   chatScrollKey: string;
   canGuideActiveRun: boolean;
   canRetryRun: boolean;
+  contextUsageDiagnostic: {
+    diagnosticId: string;
+    operation: string | null;
+    phase: string | null;
+  } | null;
+  contextUsageError: string | null;
   contextUsage: ContextUsageResponse | null;
   draftAttachments: ComposerAttachment[];
   draftMessage: string;
@@ -289,6 +298,7 @@ function ChatPanelComponent({
   onAddPastedImageAttachments: (files: File[]) => void;
   overviewRenderer: () => ReactNode;
   onCancelRun: () => void;
+  onCopyDiagnosticReference: (diagnosticId: string) => void;
   onDraftMessageChange: (value: string) => void;
   onEditMessage: (
     message: ShellMessage,
@@ -1207,6 +1217,55 @@ function ChatPanelComponent({
                     value={draftMessage}
                   />
                 </TextField>
+                {contextUsageError ? (
+                  <div
+                    aria-live="polite"
+                    className="mx-3 mb-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-[color-mix(in_oklab,var(--warning)_42%,transparent)] bg-[var(--warning-soft)] px-2 py-1.5 text-xs text-[var(--warning-foreground)]"
+                    role="status"
+                  >
+                    <span>
+                      {t("Context usage refresh failed: {error}", {
+                        error: contextUsageError,
+                      })}
+                    </span>
+                    {contextUsageDiagnostic ? (
+                      <>
+                        <span
+                          aria-label={t(
+                            "Diagnostic reference {diagnosticId}; operation {operation}; phase {phase}",
+                            {
+                              diagnosticId: contextUsageDiagnostic.diagnosticId,
+                              operation:
+                                contextUsageDiagnostic.operation ??
+                                t("Unavailable"),
+                              phase:
+                                contextUsageDiagnostic.phase ?? t("Unavailable"),
+                            },
+                          )}
+                          className="font-mono text-[11px]"
+                        >
+                          {t("Diagnostic reference: {diagnosticId}", {
+                            diagnosticId: contextUsageDiagnostic.diagnosticId,
+                          })}
+                        </span>
+                        <Button
+                          aria-label={t("Copy diagnostic reference")}
+                          className="h-5 min-h-5 px-1 text-[11px]"
+                          onPress={() =>
+                            onCopyDiagnosticReference(
+                              contextUsageDiagnostic.diagnosticId,
+                            )
+                          }
+                          size="sm"
+                          type="button"
+                          variant="ghost"
+                        >
+                          <Copy aria-hidden="true" className="size-3" />
+                        </Button>
+                      </>
+                    ) : null}
+                  </div>
+                ) : null}
                 {skillQuery !== null ? (
                   <div className="absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]">
                     <div className="panel-scroll max-h-64 overflow-y-auto py-1">

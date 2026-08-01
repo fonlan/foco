@@ -215,6 +215,100 @@ describe("app-chat-stream verification surfaces", () => {
     ).__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__;
   });
 
+  it("keeps a diagnostic context-usage failure local to the composer", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+      if (path === "/api/workspaces/workspace-1/context-usage") {
+        return Promise.resolve(
+          jsonResponse(
+            {
+              databaseIdentity: "/private/workspace.sqlite",
+              diagnostic: {
+                diagnosticId: "diagnostic-context-1",
+                operation: "chat.context_usage",
+                phase: "prompt-assembly",
+              },
+              error: "Chat is unavailable.",
+            },
+            { status: 404 },
+          ),
+        );
+      }
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    expect(
+      await screen.findByText(
+        "Context usage refresh failed: Chat is unavailable.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Diagnostic reference: diagnostic-context-1"),
+    ).toHaveAccessibleName(
+      "Diagnostic reference diagnostic-context-1; operation chat.context_usage; phase prompt-assembly",
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("/private/workspace.sqlite")).not.toBeInTheDocument();
+  });
+
+  it("shows a copyable safe diagnostic when chat stream startup fails", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+      if (path === "/api/workspaces/workspace-1/chat/stream") {
+        return Promise.resolve(
+          jsonResponse(
+            {
+              diagnostic: {
+                diagnosticId: "diagnostic-stream-1",
+                operation: "chat.stream",
+                phase: "preflight-chat-lookup",
+              },
+              error: "Chat is unavailable.",
+              workspaceDatabasePath: "/private/workspace.sqlite",
+            },
+            { status: 404 },
+          ),
+        );
+      }
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "start the diagnostic run",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Chat is unavailable.");
+    expect(alert).toHaveTextContent("Diagnostic reference: diagnostic-stream-1");
+    expect(
+      within(alert).getByLabelText(
+        "Diagnostic reference diagnostic-stream-1; operation chat.stream; phase preflight-chat-lookup",
+      ),
+    ).toBeInTheDocument();
+    expect(alert).not.toHaveTextContent("/private/workspace.sqlite");
+    await userEvent.click(
+      within(alert).getByRole("button", { name: "Copy diagnostic reference" }),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenCalledWith(
+      "diagnostic-stream-1",
+    );
+  });
+
   it("merges ordered parts by stable identity and monotonic version", () => {
     const current: ChatMessagePart[] = [
       { type: "reasoning", text: "Inspecting.", startedAtMs: 10, liveDurationMs: 40 },
