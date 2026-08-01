@@ -1002,7 +1002,7 @@ pub(crate) async fn save_workspace_settings(
         workspace.path = remote_workspace_logo_cache_path(&state.user_profile_dir, workspace_id);
         workspace.location = WorkspaceLocation::Ssh {
             server_id: server_id.to_string(),
-            remote_path,
+            remote_path: remote_path.clone(),
         };
         workspace.pinned = request.pinned;
         workspace.code_graph_enabled = request.code_graph_enabled;
@@ -1017,6 +1017,24 @@ pub(crate) async fn save_workspace_settings(
             request.code_graph_enabled,
             &previous_execution_root,
         );
+        if previous_code_graph_enabled
+            && (!request.code_graph_enabled
+                || previous_execution_root.as_os_str() != std::ffi::OsStr::new(&remote_path))
+        {
+            // Best-effort release: a connected sidecar stops its watcher now; a
+            // disconnected sidecar releases at the next config.sync because the
+            // sidecar treats a disabled bundle as no-watcher.
+            if let Err(error) =
+                crate::remote_workspace::release_remote_workspace_code_graph(&state, workspace_id)
+                    .await
+            {
+                tracing::warn!(
+                    workspace_id = %workspace_id,
+                    error = ?error,
+                    "failed to release remote workspace code graph watcher after save"
+                );
+            }
+        }
         return settings_response(&state, &config).await;
     }
 
@@ -1052,7 +1070,7 @@ pub(crate) async fn save_workspace_settings(
     let previous_execution_root = workspace.path.clone();
 
     workspace.name = name.to_string();
-    workspace.path = path;
+    workspace.path = path.clone();
     workspace.location = WorkspaceLocation::Local;
     workspace.pinned = request.pinned;
     workspace.code_graph_enabled = request.code_graph_enabled;
@@ -1068,6 +1086,16 @@ pub(crate) async fn save_workspace_settings(
         request.code_graph_enabled,
         &previous_execution_root,
     );
+    if previous_code_graph_enabled
+        && (!request.code_graph_enabled || previous_execution_root != path)
+    {
+        // Workspace disabled or execution root moved: release the old root's
+        // init task/watcher so it stops receiving file events immediately.
+        crate::runtime::release_code_graph_execution_root(
+            &state.code_graph_indexes,
+            &previous_execution_root,
+        );
+    }
 
     settings_response(&state, &config).await
 }

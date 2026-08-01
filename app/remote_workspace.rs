@@ -159,11 +159,13 @@ use crate::{
         ToolLoopBeforeExecutionAction, ToolLoopGuard, ToolOutputDeltaEvent,
         ToolResourceLockRegistry, agent_attempt_recovery_action_for_evidence,
         agent_attempt_recovery_diagnostics, blocked_tool_calls,
-        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool_with_runtime,
-        execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
+        build_sidecar_runtime_config_bundle, build_sidecar_runtime_config_bundle_for_workspace,
+        execute_image_tool, execute_tool_with_runtime, execute_web_tool, image_tool_timeout_ms,
+        is_code_graph_tool_name, materialize_brokered_image_result,
         materialize_brokered_web_result, open_workspace_database_ordinary_with_pre_stream_retry,
         package_brokered_web_result_files, pre_stream_failure_user_message,
-        reasoning_loop_guard_message, release_code_graph_then_delete_worktree, run_post_tool_hooks,
+        reasoning_loop_guard_message, release_code_graph_execution_root,
+        release_code_graph_then_delete_worktree, run_post_tool_hooks,
         spawn_code_graph_execution_root_initialization_if_needed, wait_for_code_graph_ready,
         web_tool_timeout_ms,
     },
@@ -2102,9 +2104,10 @@ impl RemoteWorkspaceManager {
             .await?;
             partial.forward_stop = Some(forward_stop);
             partial.forward_task = Some(forward_task);
-            let bundle = build_sidecar_runtime_config_bundle(
+            let bundle = build_sidecar_runtime_config_bundle_for_workspace(
                 &state.user_profile_dir,
                 config,
+                workspace_id,
                 Utc::now().timestamp_millis().max(0) as u64,
             )?;
             let active_runs = Arc::new(Mutex::new(Vec::new()));
@@ -3473,6 +3476,10 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         .route(CONTROL_WS_PATH, get(remote_control_ws))
         .route("/api/remote/health", get(remote_sidecar_health))
         .route("/api/remote/shutdown", post(remote_sidecar_shutdown))
+        .route(
+            "/api/remote/workspace/code-graph/release",
+            post(remote_sidecar_code_graph_release),
+        )
         // ponytail: workspace-scoped HTTP routes proxied from local main.
         // Sidecar handles files, git, terminal, spec, and plan routes that hit
         // the remote workspace path.  Query/path params match the local main
@@ -5262,6 +5269,15 @@ async fn remote_control_ws(
                             })
                             .unwrap_or_default();
                         if let Some(bundle) = bundle {
+                            if !bundle.payload.code_graph_enabled {
+                                // Workspace capability gate: a disabled workspace
+                                // must not keep a Code Graph watcher or registry
+                                // entry after a config resync (idempotent).
+                                release_code_graph_execution_root(
+                                    &state.code_graph_indexes,
+                                    sidecar_workspace_path(&state),
+                                );
+                            }
                             if let Ok(mut runtime_config) = state.runtime_config.lock() {
                                 *runtime_config = Some(bundle);
                             }
@@ -10216,6 +10232,43 @@ pub(crate) async fn proxy_sidecar_json_request(
         .map_err(|source| ApiError::bad_gateway(format!("invalid sidecar JSON response: {source}")))
 }
 
+/// Best-effort release of the sidecar-local Code Graph registry entry/watcher.
+///
+/// Only fires when a tunnel is already connected; a disconnected sidecar picks
+/// up the disabled toggle at the next config.sync and releases on its own. Never
+/// forces a connection just to release an index, so saving workspace settings
+/// stays cheap and non-blocking for a workspace that is not actively connected.
+pub(crate) async fn release_remote_workspace_code_graph(
+    state: &AppState,
+    workspace_id: &str,
+) -> Result<(), ApiError> {
+    let (base, token) = match sidecar_proxy_target(state, workspace_id)? {
+        SidecarProxyTarget::Connected { base, token } => (base, token),
+        SidecarProxyTarget::Local | SidecarProxyTarget::Disconnected => return Ok(()),
+    };
+    let url = format!(
+        "{}/api/remote/workspace/code-graph/release",
+        base.trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(token)
+        .send()
+        .await
+        .map_err(|source| {
+            ApiError::bad_gateway(format!("sidecar code graph release failed: {source}"))
+        })?;
+    let status = response.status();
+    let _ = response.bytes().await;
+    if !status.is_success() {
+        return Err(ApiError::from_status_message(
+            status,
+            "sidecar code graph release failed".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn install_remote_workspace_skill(
     state: &AppState,
     workspace_id: &str,
@@ -10383,6 +10436,23 @@ fn ensure_sidecar_code_graph(
     state: &RemoteSidecarState,
     execution_root: &Path,
 ) -> Result<(), axum::response::Response> {
+    // Workspace capability gate: a disabled workspace must never start an index
+    // or watcher, even if a stale/forged request carries the ensure header.
+    let code_graph_enabled = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| {
+            config
+                .as_ref()
+                .map(|bundle| bundle.payload.code_graph_enabled)
+        })
+        .unwrap_or(false);
+    if !code_graph_enabled {
+        return Err(
+            ApiError::forbidden("Code Graph is disabled for this remote workspace").into_response(),
+        );
+    }
     // HTTP Graph compatibility path: ensure the requested execution root is
     // claimed/initialized and wait until Ready (or surface a clear failure).
     // Agent chat tools use the shared registry via execute_tool readiness instead.
@@ -10440,6 +10510,16 @@ fn release_sidecar_code_graph_then_delete_worktree(
     release_code_graph_then_delete_worktree(&state.code_graph_indexes, worktree_path, || {
         delete_agent_worktree(workspace_path, worktree_path, true)
     })
+}
+
+/// Idempotent release of the sidecar-local Code Graph registry entry/watcher for
+/// the remote workspace root. Never ensures or starts an index; the host calls
+/// this when a workspace disables Code Graph or changes its execution root.
+async fn remote_sidecar_code_graph_release(
+    State(state): State<RemoteSidecarState>,
+) -> Result<Json<Value>, axum::response::Response> {
+    release_code_graph_execution_root(&state.code_graph_indexes, sidecar_workspace_path(&state));
+    Ok(Json(json!({ "ok": true })))
 }
 
 fn release_sidecar_plan_worktrees_after_merge(
@@ -13728,6 +13808,15 @@ async fn build_remote_tool_catalog(
     if !discovery.apply_patch_available {
         builtin_tools.retain(|tool| tool.name != foco_tools::APPLY_PATCH_TOOL);
     }
+    // Workspace-scoped Code Graph capability gate: the sidecar tool catalog must
+    // match the host for disabled workspaces (graph tools are not offered, routed,
+    // or executable). A pre-sync bundle defaults to disabled.
+    if !bundle
+        .map(|bundle| bundle.payload.code_graph_enabled)
+        .unwrap_or(false)
+    {
+        builtin_tools.retain(|tool| !is_code_graph_tool_name(&tool.name));
+    }
     let mut memory_tools = if bundle.is_some_and(|bundle| bundle.payload.memory.enabled) {
         memory_tool_definitions()
     } else {
@@ -15598,6 +15687,13 @@ fn remote_sidecar_runtime_global_config(
         global_config.memory = bundle.payload.memory;
         global_config.spec = bundle.payload.spec;
         global_config.plan = bundle.payload.plan;
+        // `first_run` only creates a default workspace; align it with the actual
+        // sidecar workspace identity and the synced Code Graph capability toggle
+        // so workspace lookups and the runtime gate match the host config.
+        if let Some(workspace) = global_config.workspaces.first_mut() {
+            workspace.id = state.workspace_id.clone();
+            workspace.code_graph_enabled = bundle.payload.code_graph_enabled;
+        }
     }
     Ok(global_config)
 }
@@ -44760,6 +44856,40 @@ mod tests {
         assert!(!disabled.allows("memory_write"));
         assert!(!disabled.allows("web_search"));
         assert!(disabled.allows("web_fetch"));
+        assert!(
+            disabled
+                .tools
+                .iter()
+                .all(|tool| !is_code_graph_tool_name(&tool.name)),
+            "disabled workspace must not offer Code Graph tools"
+        );
+
+        // An enabled workspace bundle keeps the Code Graph tools.
+        enabled_config.workspaces[0].code_graph_enabled = true;
+        let enabled_code_graph_bundle = build_sidecar_runtime_config_bundle_for_workspace(
+            workspace.path(),
+            &enabled_config,
+            "default",
+            2,
+        )
+        .expect("enabled code graph bundle");
+        let enabled_code_graph = build_remote_tool_catalog(
+            Some(&enabled_code_graph_bundle),
+            None,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            "workspace",
+            false,
+            None,
+        )
+        .await;
+        assert!(
+            enabled_code_graph
+                .tools
+                .iter()
+                .any(|tool| is_code_graph_tool_name(&tool.name)),
+            "enabled workspace must offer Code Graph tools"
+        );
     }
 
     #[test]
@@ -44849,6 +44979,29 @@ mod tests {
             remote_sidecar_resolve_web_search_route(&native_bundle, "gpt-4o"),
             WebSearchRoute::ProviderNative
         );
+    }
+
+    #[test]
+    fn ensure_sidecar_code_graph_rejects_disabled_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
+
+        // A pre-sync sidecar has no runtime config; the gate must fail closed and
+        // never start an index even for a stale/forged ensure request.
+        let response = ensure_sidecar_code_graph(&state, workspace.path())
+            .expect_err("disabled workspace must be rejected");
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+
+        // An explicit disabled bundle is rejected the same way.
+        let disabled_config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        let disabled_bundle =
+            build_sidecar_runtime_config_bundle(workspace.path(), &disabled_config, 1)
+                .expect("disabled bundle");
+        *state.runtime_config.lock().expect("runtime config lock") = Some(disabled_bundle);
+        let response = ensure_sidecar_code_graph(&state, workspace.path())
+            .expect_err("disabled bundle must be rejected");
+        assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
     }
 
     /// Remote route matrix: local and sidecar resolvers agree; catalog vs native injection.

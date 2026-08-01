@@ -803,6 +803,18 @@ async fn remote_workspace_proxy_middleware(
         }
     }
     if is_code_graph_request {
+        // Workspace-scoped Code Graph capability gate: a disabled workspace must
+        // never trigger sidecar index initialization. Respond explicitly instead
+        // of forwarding the ensure header. Lock failure fails closed.
+        let code_graph_enabled = crate::config_snapshot(&state)
+            .map(|config| {
+                crate::runtime::code_graph_tools_enabled_for_workspace(&config, &workspace_id)
+            })
+            .unwrap_or(false);
+        if !code_graph_enabled {
+            return crate::ApiError::forbidden("Code Graph is disabled for this workspace")
+                .into_response();
+        }
         req = req.header("x-foco-ensure-code-graph", "1");
     }
     match req.send().await {

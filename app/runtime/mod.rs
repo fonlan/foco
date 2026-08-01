@@ -40,10 +40,9 @@ pub(crate) use broker_artifacts::BrokeredTransferFile;
 #[cfg(test)]
 pub(crate) use chat_run::agent_run_event_kind;
 pub(crate) use chat_run::run_chat_context_in_background;
-#[cfg(test)]
-pub(crate) use code_graph::release_code_graph_execution_root;
 pub(crate) use code_graph::{
-    CodeGraphIndexState, CodeGraphReadinessError, release_code_graph_then_delete_worktree,
+    CodeGraphIndexState, CodeGraphReadinessError, release_code_graph_execution_root,
+    release_code_graph_then_delete_worktree,
     spawn_code_graph_execution_root_initialization_if_needed, wait_for_code_graph_ready,
 };
 pub(crate) use foco_store::workspace::AGENT_MESSAGE_GUIDANCE_SOURCE;
@@ -77,7 +76,10 @@ pub(crate) use reasoning_loop_detector::{
     REASONING_LOOP_RECOVERY_USER_TEXT, ReasoningLoopDetector, default_guidance_source,
     is_automatic_guard_source, reasoning_loop_guard_message,
 };
-pub(crate) use sidecar_config::{SidecarRuntimeConfigBundle, build_sidecar_runtime_config_bundle};
+pub(crate) use sidecar_config::{
+    SidecarRuntimeConfigBundle, build_sidecar_runtime_config_bundle,
+    build_sidecar_runtime_config_bundle_for_workspace,
+};
 pub(crate) use subscriptions::{
     ActiveAgentRunIdentity, ActiveChatRunRegistration, ActiveChatRunRegistrationResult,
     ActiveChatRunRegistry, ActiveChatRunSubscription, ActiveChatRunSummary,
@@ -89,8 +91,9 @@ pub(crate) use tool_events::{ToolOutputDeltaEvent, ToolOutputDeltaSink};
 pub(crate) use tool_execution::wait_for_tool_resource_lock;
 pub(crate) use tool_execution::{
     AgentToolContext, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
-    RepeatedToolCallDetector, ToolLoopBeforeExecutionAction, execute_tool_calls_parallel,
-    is_agent_tool_name, is_agent_wait_suspend_output, pending_tool_calls,
+    RepeatedToolCallDetector, ToolLoopBeforeExecutionAction,
+    code_graph_tools_enabled_for_workspace, execute_tool_calls_parallel, is_agent_tool_name,
+    is_agent_wait_suspend_output, is_code_graph_tool_name, pending_tool_calls,
     try_register_implicit_wait_for_undelivered_children,
 };
 pub(crate) use tool_execution::{

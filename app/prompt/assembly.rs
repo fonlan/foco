@@ -8,7 +8,10 @@ use crate::memory_runtime::{
     memory_retrieval_query_text, neutral_messages_from_record,
     stored_turn_memory_messages_by_sequence,
 };
-use crate::runtime::open_workspace_database_ordinary_with_pre_stream_retry;
+use crate::runtime::{
+    code_graph_tools_enabled_for_workspace, is_code_graph_tool_name,
+    open_workspace_database_ordinary_with_pre_stream_retry,
+};
 use crate::*;
 use foco_store::config::PLAN_MODE_SYSTEM_PROMPT_NAME;
 use foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND;
@@ -291,6 +294,12 @@ pub(crate) async fn prepare_prompt_context_with_lifecycle(
         builtin_tool_definitions_for_runtime(ripgrep_available, web_search_function_available);
     if !apply_patch_available_for_model(config, &model.id)? {
         builtin_tool_definitions.retain(|tool| tool.name != foco_tools::APPLY_PATCH_TOOL);
+    }
+    // Workspace-scoped Code Graph capability gate: disabled workspaces never
+    // receive graph tools in provider requests, Agent capabilities, or routing
+    // hints. The saved global tool catalog is left untouched.
+    if !code_graph_tools_enabled_for_workspace(config, &workspace.id) {
+        builtin_tool_definitions.retain(|tool| !is_code_graph_tool_name(&tool.name));
     }
     let mut memory_tool_definitions = if config.memory.enabled {
         memory_tool_definitions()

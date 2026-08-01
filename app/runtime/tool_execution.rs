@@ -234,6 +234,22 @@ pub(crate) fn is_code_graph_tool_name(tool_name: &str) -> bool {
     )
 }
 
+/// Whether the workspace currently allows Code Graph tools to be offered or executed.
+///
+/// This is the single runtime capability gate shared by prompt assembly, Agent
+/// allowlists, tool routing, and the execution boundary. Unknown workspace ids
+/// default to disabled so a stale or foreign config can never start an index.
+pub(crate) fn code_graph_tools_enabled_for_workspace(
+    config: &GlobalConfig,
+    workspace_id: &str,
+) -> bool {
+    config
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .is_some_and(|workspace| workspace.code_graph_enabled)
+}
+
 fn builtin_tool_uses_workspace_database(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -1385,6 +1401,21 @@ async fn execute_tool_unbudgeted(
             tool_workspace_path
         };
         if is_code_graph_tool_name(&tool_name) {
+            if !code_graph_tools_enabled_for_workspace(global_config, workspace_id) {
+                // Defensive execution boundary: a stale or direct graph tool call
+                // must never start an index or create a registry entry for a
+                // disabled workspace (local and remote sidecar share this path).
+                return ToolExecutionWithHooks {
+                    execution: ToolExecution {
+                        output: json!({
+                            "error": "Code Graph is disabled for this workspace. Enable it in workspace settings to use graph tools.",
+                            "code": "code_graph_disabled",
+                        }),
+                        is_error: true,
+                    },
+                    hook_summary,
+                };
+            }
             let indexes = code_graph_indexes.clone();
             let execution_root = builtin_workspace_path.to_path_buf();
             // Graph startup is intentionally demand-driven: normal chat and

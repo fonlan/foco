@@ -28,7 +28,10 @@ use tokio::sync::{broadcast, mpsc};
 use crate::git_backend::{
     AgentWorktreeInfo, agent_worktree_relative_path, create_agent_worktree, delete_agent_worktree,
 };
-use crate::runtime::{ActiveChatRunRegistrationResult, release_code_graph_then_delete_worktree};
+use crate::runtime::{
+    ActiveChatRunRegistrationResult, code_graph_tools_enabled_for_workspace,
+    is_code_graph_tool_name, release_code_graph_then_delete_worktree,
+};
 use crate::*;
 
 type BoxedChatEventStream =
@@ -1541,10 +1544,15 @@ async fn default_agent_definition(
 
 async fn default_agent_allowed_tools(
     _state: &AppState,
-    _config: &GlobalConfig,
+    config: &GlobalConfig,
     prompt_context: &PreparedPromptContext,
 ) -> Result<Vec<String>, ApiError> {
     let mut tools = prompt_context.default_agent_tool_capabilities.clone();
+    // Defensive workspace capability gate in addition to prompt assembly: the
+    // default Coordinator must never receive graph tools for a disabled workspace.
+    if !code_graph_tools_enabled_for_workspace(config, &prompt_context.workspace_id) {
+        tools.retain(|tool| !is_code_graph_tool_name(tool));
+    }
     tools.sort();
     tools.dedup();
     Ok(tools)

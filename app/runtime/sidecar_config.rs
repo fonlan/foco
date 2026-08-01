@@ -84,6 +84,10 @@ pub(crate) struct SidecarRuntimeConfigPayload {
     pub(crate) required_disabled_skill_keys: Vec<String>,
     #[serde(default)]
     pub(crate) selected_skills: Vec<SidecarRuntimeSkillContent>,
+    /// Workspace-scoped Code Graph capability toggle synced from the host.
+    /// Defaults to disabled so a pre-sync sidecar never exposes graph tools.
+    #[serde(default)]
+    pub(crate) code_graph_enabled: bool,
 }
 
 /// Secret-free provider route snapshot for remote prompt assembly.
@@ -176,6 +180,38 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
     config: &GlobalConfig,
     config_generation: u64,
 ) -> Result<SidecarRuntimeConfigBundle, ApiError> {
+    build_sidecar_runtime_config_bundle_with_code_graph(
+        user_profile_dir,
+        config,
+        config_generation,
+        false,
+    )
+}
+
+/// Build a sidecar config bundle carrying the target workspace's Code Graph
+/// toggle. Production sidecar connections use this so the remote runtime applies
+/// the same workspace capability gate as the local runtime.
+pub(crate) fn build_sidecar_runtime_config_bundle_for_workspace(
+    user_profile_dir: &Path,
+    config: &GlobalConfig,
+    workspace_id: &str,
+    config_generation: u64,
+) -> Result<SidecarRuntimeConfigBundle, ApiError> {
+    let workspace = crate::workspace_by_id(config, workspace_id)?;
+    build_sidecar_runtime_config_bundle_with_code_graph(
+        user_profile_dir,
+        config,
+        config_generation,
+        workspace.code_graph_enabled,
+    )
+}
+
+fn build_sidecar_runtime_config_bundle_with_code_graph(
+    user_profile_dir: &Path,
+    config: &GlobalConfig,
+    config_generation: u64,
+    code_graph_enabled: bool,
+) -> Result<SidecarRuntimeConfigBundle, ApiError> {
     let (global_skills, required_disabled_skill_keys) =
         global_skill_content(user_profile_dir, config)?;
     let payload = SidecarRuntimeConfigPayload {
@@ -201,6 +237,7 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
         disabled_skill_location_ids: config.skills.disabled_locations.clone(),
         required_disabled_skill_keys,
         selected_skills: Vec::new(),
+        code_graph_enabled,
     };
     let payload_json = serde_json::to_vec(&payload).map_err(|source| {
         ApiError::internal(format!("sidecar config serialization failed: {source}"))
@@ -852,5 +889,59 @@ mod tests {
         assert!(parsed.payload.required_disabled_skill_keys.is_empty());
         assert_eq!(parsed.payload.selected_skills[0].description, "");
         assert_eq!(parsed.payload.selected_skills[0].scope, SKILL_SCOPE_GLOBAL);
+    }
+
+    #[test]
+    fn sidecar_runtime_bundle_code_graph_enabled_defaults_disabled_and_follows_workspace() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+
+        // The plain bundle has no workspace identity and must stay disabled so a
+        // pre-sync sidecar never exposes graph tools.
+        let plain = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("plain runtime bundle");
+        assert!(!plain.payload.code_graph_enabled);
+
+        // A workspace-scoped bundle follows the workspace toggle.
+        let for_disabled = build_sidecar_runtime_config_bundle_for_workspace(
+            profile.path(),
+            &config,
+            "default",
+            2,
+        )
+        .expect("disabled workspace bundle");
+        assert!(!for_disabled.payload.code_graph_enabled);
+
+        config
+            .workspaces
+            .iter_mut()
+            .find(|workspace| workspace.id == foco_store::config::DEFAULT_WORKSPACE_ID)
+            .expect("default workspace")
+            .code_graph_enabled = true;
+        let for_enabled = build_sidecar_runtime_config_bundle_for_workspace(
+            profile.path(),
+            &config,
+            "default",
+            3,
+        )
+        .expect("enabled workspace bundle");
+        assert!(for_enabled.payload.code_graph_enabled);
+        let enabled_json = serde_json::to_value(&for_enabled).expect("enabled bundle json");
+        assert_eq!(
+            enabled_json["payload"]["codeGraphEnabled"],
+            Value::Bool(true)
+        );
+
+        // Legacy payloads missing the field deserialize to disabled.
+        let mut legacy = serde_json::to_value(&plain).expect("plain bundle json");
+        legacy
+            .get_mut("payload")
+            .and_then(Value::as_object_mut)
+            .expect("payload object")
+            .remove("codeGraphEnabled");
+        let parsed = serde_json::from_value::<SidecarRuntimeConfigBundle>(legacy)
+            .expect("legacy bundle parse");
+        assert!(!parsed.payload.code_graph_enabled);
     }
 }

@@ -261,9 +261,11 @@ async fn assert_tool_lock_waiter_blocks(
 }
 
 fn wait_for_code_graph_watchers(indexes: &Arc<Mutex<CodeGraphIndexState>>, expected_count: usize) {
-    // ponytail: production lazy indexing is detached; poll the existing watcher count with a
-    // short timeout. If this test needs stronger timing, return a test-only join handle.
-    for _ in 0..250 {
+    // ponytail: production lazy indexing is detached and process-gated to a single
+    // concurrent init (MAX_CONCURRENT_CODE_GRAPH_INITS), so parallel tests can queue
+    // behind another test's index. Poll up to 10s; callers return as soon as the
+    // count matches, so the common case stays fast.
+    for _ in 0..1000 {
         if indexes
             .lock()
             .expect("code graph index lock")
@@ -27175,6 +27177,47 @@ async fn workspace_code_graph_toggle_round_trips_through_add_and_save() {
 }
 
 #[tokio::test]
+async fn disabling_workspace_code_graph_releases_local_watcher() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-codegraph-release-workspace-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-codegraph-release-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+
+    let mut config = GlobalConfig::first_run(workspace_dir.clone());
+    config.workspaces[0].code_graph_enabled = true;
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    // Enabled workspace starts a watcher on demand (existing behavior).
+    crate::runtime::spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        workspace_dir.clone(),
+        "test-disabled-toggle",
+    );
+    wait_for_code_graph_watchers(&state.code_graph_indexes, 1);
+
+    // Saving the workspace with the toggle off releases the execution root so
+    // the watcher stops receiving file events immediately.
+    let manual_request: ManualWorkspaceRequest = serde_json::from_value(serde_json::json!({
+        "id": config.workspaces[0].id.clone(),
+        "name": config.workspaces[0].name,
+        "path": workspace_dir.display().to_string(),
+        "pinned": false,
+        "codeGraphEnabled": false,
+        "terminalShell": DEFAULT_TERMINAL_SHELL,
+        "commonCommands": [],
+    }))
+    .expect("manual workspace request deserializes");
+    let _ = save_workspace_settings(State(state.clone()), Json(manual_request))
+        .await
+        .expect("save workspace with code graph disabled");
+    wait_for_code_graph_watchers(&state.code_graph_indexes, 0);
+
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn create_terminal_session_defaults_to_workspace_directory() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-terminal-workspace-test"));
     let nested_dir = workspace_dir.join("nested");
@@ -28502,6 +28545,107 @@ Use this only after reading the skill file.
     assert!(!available_tools_message.content.contains(mcp_tool_name));
 
     drop(context);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prepare_prompt_context_applies_workspace_code_graph_gate() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-codegraph-gate-prompt-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-codegraph-gate-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    config.workspaces[0].code_graph_enabled = false;
+    let state = test_app_state(config.clone(), profile_dir.clone());
+
+    let disabled_context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: Some("run a task".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ContextPreview,
+    )
+    .await
+    .expect("disabled workspace prompt context");
+    assert!(
+        !disabled_context
+            .default_agent_tool_capabilities
+            .iter()
+            .any(|tool| crate::runtime::is_code_graph_tool_name(tool)),
+        "disabled workspace must not offer graph tools to default Agent capabilities"
+    );
+    assert!(
+        !disabled_context
+            .provider_request
+            .tools
+            .iter()
+            .any(|tool| crate::runtime::is_code_graph_tool_name(&tool.name)),
+        "disabled workspace must not send graph tools to the provider"
+    );
+    assert!(
+        disabled_context
+            .default_agent_tool_capabilities
+            .contains(&WRITE_FILE_TOOL.to_string())
+            && disabled_context
+                .default_agent_tool_capabilities
+                .contains(&RUN_COMMAND_TOOL.to_string())
+            && disabled_context
+                .default_agent_tool_capabilities
+                .contains(&CREATE_TODO_GRAPH_TOOL.to_string()),
+        "non-graph default tools must survive the disabled gate"
+    );
+
+    config.workspaces[0].code_graph_enabled = true;
+    let enabled_context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: Some("run a task".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ContextPreview,
+    )
+    .await
+    .expect("enabled workspace prompt context");
+    assert!(
+        enabled_context
+            .default_agent_tool_capabilities
+            .iter()
+            .any(|tool| crate::runtime::is_code_graph_tool_name(tool)),
+        "enabled workspace must keep graph tools in default Agent capabilities"
+    );
+
+    drop(enabled_context);
+    drop(disabled_context);
     drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);

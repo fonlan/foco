@@ -41,6 +41,7 @@ use crate::git_backend::{
     agent_instance_worktree_path, agent_worktree_diff_id, git_diff_response,
     resolve_agent_worktree_path,
 };
+use crate::runtime::{code_graph_tools_enabled_for_workspace, is_code_graph_tool_name};
 use crate::*;
 
 // ponytail: fixed first-slice limits avoid new config surface; make them configurable when
@@ -1727,12 +1728,18 @@ async fn run_coordinator_task_inner(
             agent_instance_execution_root(&workspace.path, &instance)
         }
     };
-    let allowed_tools = instance
+    let mut allowed_tools = instance
         .definition_snapshot
         .allowed_tools
         .iter()
         .cloned()
         .collect::<HashSet<_>>();
+    // Workspace-scoped Code Graph capability gate: saved Agent definitions keep
+    // their global allowedTools, but a disabled workspace strips graph tools from
+    // the runtime snapshot, tool routing, and the execution allowlist.
+    if !code_graph_tools_enabled_for_workspace(&config, &workspace.id) {
+        allowed_tools.retain(|tool| !is_code_graph_tool_name(tool));
+    }
     retain_agent_snapshot_tools(&mut chat_context.provider_request.tools, &allowed_tools);
     let removed_tool_routing = sync_agent_tool_routing_prompt(
         &mut chat_context.provider_request.messages,
