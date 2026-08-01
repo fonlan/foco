@@ -390,6 +390,7 @@ impl GlobalConfig {
                 path: default_workspace_path,
                 location: WorkspaceLocation::Local,
                 pinned: false,
+                code_graph_enabled: false,
                 terminal_shell: default_terminal_shell(),
                 common_commands: Vec::new(),
             }],
@@ -1633,6 +1634,12 @@ pub struct WorkspaceConfig {
     pub location: WorkspaceLocation,
     #[serde(default)]
     pub pinned: bool,
+    /// Whether the workspace Codegraph index and graph tools are enabled.
+    ///
+    /// Defaults to disabled so configuration written before this field keeps
+    /// Codegraph off; explicit true/false values round-trip.
+    #[serde(default, rename = "codeGraphEnabled")]
+    pub code_graph_enabled: bool,
     #[serde(default = "default_terminal_shell")]
     pub terminal_shell: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -3620,6 +3627,7 @@ mod tests {
                 remote_path: "/srv/project".to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "bash".to_string(),
             common_commands: Vec::new(),
         });
@@ -3655,6 +3663,7 @@ mod tests {
                     remote_path: "/srv/project".to_string(),
                 },
                 pinned: false,
+                code_graph_enabled: false,
                 terminal_shell: "bash".to_string(),
                 common_commands: Vec::new(),
             },
@@ -3782,6 +3791,10 @@ mod tests {
         );
         assert_eq!(loaded.workspaces[2].server_id(), Some("srv"));
         assert_eq!(loaded.workspaces[2].remote_path(), Some("/work/repo"));
+        // Workspaces written before the toggle existed default to disabled.
+        assert!(!loaded.workspaces[0].code_graph_enabled);
+        assert!(!loaded.workspaces[1].code_graph_enabled);
+        assert!(!loaded.workspaces[2].code_graph_enabled);
         assert_eq!(loaded.mcp.servers[0].execution_host, McpExecutionHost::Auto);
         assert_eq!(
             loaded.mcp.servers[1].execution_host,
@@ -3813,6 +3826,7 @@ mod tests {
                 remote_path: "relative/project".to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "bash".to_string(),
             common_commands: Vec::new(),
         });
@@ -5841,5 +5855,41 @@ mod tests {
         assert_eq!(snapshot.provider_id, "provider-1");
         assert_eq!(snapshot.model_id, "model-1");
         assert!(config.agent_definitions.is_empty());
+    }
+
+    #[test]
+    fn workspace_code_graph_enabled_defaults_to_disabled_and_round_trips() {
+        let workspace_dir = tempfile::tempdir().expect("workspace");
+        let config = GlobalConfig::first_run(workspace_dir.path().to_path_buf());
+        assert!(!config.workspaces[0].code_graph_enabled);
+        assert!(!config.workspaces[0].is_remote());
+
+        // Legacy workspace JSON without the field deserializes as disabled.
+        let legacy: WorkspaceConfig = serde_json::from_str(
+            r#"{
+                "id": "legacy",
+                "name": "Legacy",
+                "path": "/tmp/legacy",
+                "pinned": false
+            }"#,
+        )
+        .expect("legacy workspace deserializes");
+        assert!(!legacy.code_graph_enabled);
+
+        // Explicit true/false values survive a serialize round-trip and keep
+        // the camelCase JSON name used by the API.
+        let mut enabled = legacy.clone();
+        enabled.code_graph_enabled = true;
+        let json = serde_json::to_string(&enabled).expect("serialize workspace");
+        assert!(json.contains("\"codeGraphEnabled\":true"));
+        let restored: WorkspaceConfig = serde_json::from_str(&json).expect("reload workspace");
+        assert!(restored.code_graph_enabled);
+        assert_eq!(restored, enabled);
+
+        let mut disabled = enabled.clone();
+        disabled.code_graph_enabled = false;
+        let json = serde_json::to_string(&disabled).expect("serialize workspace");
+        let restored: WorkspaceConfig = serde_json::from_str(&json).expect("reload workspace");
+        assert!(!restored.code_graph_enabled);
     }
 }

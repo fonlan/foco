@@ -38,6 +38,8 @@ pub(crate) struct WorkspacePathRequest {
     pub(crate) terminal_shell: Option<String>,
     #[serde(default)]
     pub(crate) content_base64: Option<String>,
+    #[serde(default)]
+    pub(crate) code_graph_enabled: bool,
 }
 
 #[derive(Deserialize)]
@@ -51,6 +53,8 @@ pub(crate) struct ManualWorkspaceRequest {
     #[serde(default)]
     remote_path: Option<String>,
     pinned: bool,
+    #[serde(default)]
+    code_graph_enabled: bool,
     terminal_shell: String,
     #[serde(default)]
     common_commands: Vec<WorkspaceCommonCommandRequest>,
@@ -580,6 +584,7 @@ pub(crate) async fn search_workspace_chats(
             last_remote_error: remote.last_remote_error,
             logo_url: workspace_logo_url(workspace)?,
             pinned: workspace.pinned,
+            code_graph_enabled: workspace.code_graph_enabled,
             terminal_shell: workspace.terminal_shell.clone(),
             common_commands: settings_runtime::workspace_common_command_summaries(
                 &workspace.common_commands,
@@ -687,6 +692,7 @@ pub(crate) async fn add_workspace(
     } else {
         None
     };
+    let code_graph_enabled = request.code_graph_enabled;
     let (name, requested_path) = validate_workspace_request(request)?;
 
     if requested_path.exists() && !requested_path.is_dir() {
@@ -728,6 +734,7 @@ pub(crate) async fn add_workspace(
             path,
             location: WorkspaceLocation::Local,
             pinned: false,
+            code_graph_enabled,
             terminal_shell: default_terminal_shell_for_current_platform().to_string(),
             common_commands: Vec::new(),
         },
@@ -834,6 +841,7 @@ async fn add_remote_workspace(
                 remote_path: remote_path.to_string(),
             },
             pinned: false,
+            code_graph_enabled: request.code_graph_enabled,
             terminal_shell,
             common_commands: Vec::new(),
         },
@@ -983,6 +991,13 @@ pub(crate) async fn save_workspace_settings(
             .ok_or_else(|| {
                 ApiError::bad_request(format!("workspace was not found: {workspace_id}"))
             })?;
+        // Preserve the pre-save toggle state and execution root so the next
+        // phase can stop/release an active Codegraph watcher on transitions.
+        let previous_code_graph_enabled = workspace.code_graph_enabled;
+        let previous_execution_root = workspace
+            .remote_path()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| workspace.path.clone());
         workspace.name = name.to_string();
         workspace.path = remote_workspace_logo_cache_path(&state.user_profile_dir, workspace_id);
         workspace.location = WorkspaceLocation::Ssh {
@@ -990,11 +1005,18 @@ pub(crate) async fn save_workspace_settings(
             remote_path,
         };
         workspace.pinned = request.pinned;
+        workspace.code_graph_enabled = request.code_graph_enabled;
         workspace.terminal_shell = terminal_shell;
         workspace.common_commands = common_commands;
         group_pinned_workspaces(&mut config.workspaces);
         promote_pinned_workspace(&mut config.workspaces, workspace_id);
         save_config(&state, &mut config)?;
+        log_code_graph_enabled_transition(
+            workspace_id,
+            previous_code_graph_enabled,
+            request.code_graph_enabled,
+            &previous_execution_root,
+        );
         return settings_response(&state, &config).await;
     }
 
@@ -1024,17 +1046,28 @@ pub(crate) async fn save_workspace_settings(
         .iter_mut()
         .find(|workspace| workspace.id == workspace_id)
         .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
+    // Preserve the pre-save toggle state and execution root so the next phase
+    // can stop/release an active Codegraph watcher on transitions.
+    let previous_code_graph_enabled = workspace.code_graph_enabled;
+    let previous_execution_root = workspace.path.clone();
 
     workspace.name = name.to_string();
     workspace.path = path;
     workspace.location = WorkspaceLocation::Local;
     workspace.pinned = request.pinned;
+    workspace.code_graph_enabled = request.code_graph_enabled;
     workspace.terminal_shell = terminal_shell;
     workspace.common_commands = common_commands;
     group_pinned_workspaces(&mut config.workspaces);
     promote_pinned_workspace(&mut config.workspaces, workspace_id);
 
     save_config(&state, &mut config)?;
+    log_code_graph_enabled_transition(
+        workspace_id,
+        previous_code_graph_enabled,
+        request.code_graph_enabled,
+        &previous_execution_root,
+    );
 
     settings_response(&state, &config).await
 }
@@ -1432,6 +1465,28 @@ pub(crate) fn workspace_image_content_type(bytes: &[u8]) -> Result<&'static str,
     Err(ApiError::bad_request(
         "workspace file preview only supports PNG, JPEG, WebP, GIF, or SVG images",
     ))
+}
+
+/// Emits a structured transition record when a workspace's Codegraph toggle
+/// changes at save time. The pre-save enabled state and execution root are
+/// captured before mutation so the runtime can converge watcher lifecycle in a
+/// later phase; no-op when the toggle is unchanged.
+fn log_code_graph_enabled_transition(
+    workspace_id: &str,
+    previous_enabled: bool,
+    current_enabled: bool,
+    execution_root: &Path,
+) {
+    if previous_enabled == current_enabled {
+        return;
+    }
+    tracing::info!(
+        workspace_id = %workspace_id,
+        code_graph_enabled = current_enabled,
+        previous_code_graph_enabled = previous_enabled,
+        execution_root = %execution_root.display(),
+        "workspace code graph enabled state changed"
+    );
 }
 
 #[cfg(test)]

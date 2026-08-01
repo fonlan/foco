@@ -631,6 +631,7 @@ pub(crate) struct ConfiguredWorkspaceSummary {
     pub(crate) last_remote_error: Option<String>,
     pub(crate) logo_url: Option<String>,
     pub(crate) pinned: bool,
+    pub(crate) code_graph_enabled: bool,
     pub(crate) terminal_shell: String,
     pub(crate) common_commands: Vec<WorkspaceCommonCommandSummary>,
     pub(crate) is_default: bool,

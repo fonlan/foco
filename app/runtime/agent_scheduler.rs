@@ -4213,6 +4213,7 @@ mod tests {
                     remote_path: "/srv/project".to_string(),
                 },
                 pinned: false,
+                code_graph_enabled: false,
                 terminal_shell: "bash".to_string(),
                 common_commands: Vec::new(),
             },

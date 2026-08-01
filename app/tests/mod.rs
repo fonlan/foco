@@ -100,7 +100,10 @@ use crate::http::{
         workspace_spec, workspace_spec_jobs,
     },
     terminal::create_terminal_session,
-    workspaces::{WorkspacePathRequest, add_workspace, delete_workspace, workspace_logo_thumbnail},
+    workspaces::{
+        ManualWorkspaceRequest, WorkspacePathRequest, add_workspace, delete_workspace,
+        save_workspace_settings, workspace_logo_thumbnail,
+    },
 };
 use crate::memory_runtime::scheduler::{
     dispatch_auto_memory_dreams_at, memory_dream_interval_due, reconcile_memory_dream_runs,
@@ -6400,6 +6403,7 @@ fn discover_skills_ignores_missing_directories() {
         path: workspace_dir.clone(),
         location: WorkspaceLocation::Local,
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     }];
@@ -12761,6 +12765,7 @@ fn workspace_database_startup_skips_remote_workspaces_without_local_paths() {
                 remote_path: "/srv/project".to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "bash".to_string(),
             common_commands: Vec::new(),
         },
@@ -12770,6 +12775,7 @@ fn workspace_database_startup_skips_remote_workspaces_without_local_paths() {
             path: local_workspace.path().to_path_buf(),
             location: foco_store::config::WorkspaceLocation::Local,
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "zsh".to_string(),
             common_commands: Vec::new(),
         },
@@ -12798,6 +12804,7 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
                 remote_path: "/srv/reconcile".to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "bash".to_string(),
             common_commands: Vec::new(),
         },
@@ -17378,6 +17385,7 @@ async fn scheduled_tasks_list_skips_missing_workspace_paths() {
         path: missing_workspace_dir.clone(),
         location: WorkspaceLocation::Local,
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     });
@@ -17460,6 +17468,7 @@ async fn scheduled_tasks_list_missing_workspace_path_filter_returns_error() {
         path: missing_workspace_dir.clone(),
         location: WorkspaceLocation::Local,
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     }];
@@ -17529,6 +17538,7 @@ async fn scheduled_tasks_list_remote_workspace_filter_returns_error() {
             remote_path: "/srv/project".to_string(),
         },
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     });
@@ -17602,6 +17612,7 @@ async fn scheduled_task_dispatch_skips_missing_workspace_paths() {
         path: missing_workspace_dir,
         location: WorkspaceLocation::Local,
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     });
@@ -19140,6 +19151,7 @@ fn persist_chat_result_for_plan_phase_defers_derived_effects_until_integration()
         path: workspace_dir.clone(),
         location: WorkspaceLocation::Local,
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     });
@@ -26849,6 +26861,7 @@ async fn add_workspace_creates_missing_directory_and_registers_it() {
             server_id: None,
             remote_path: None,
             terminal_shell: None,
+            code_graph_enabled: false,
             content_base64: Some(
                 general_purpose::STANDARD.encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
             ),
@@ -26918,6 +26931,7 @@ async fn add_workspace_allows_empty_logo_content() {
             server_id: None,
             remote_path: None,
             terminal_shell: None,
+            code_graph_enabled: false,
             content_base64: Some(String::new()),
         }),
     )
@@ -26971,6 +26985,7 @@ async fn add_remote_workspace_with_logo_returns_logo_url() {
             server_id: Some("remote-server".to_string()),
             remote_path: Some("/srv/remote-workspace".to_string()),
             terminal_shell: None,
+            code_graph_enabled: false,
             content_base64: Some(
                 general_purpose::STANDARD.encode([0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
             ),
@@ -27056,6 +27071,106 @@ async fn add_remote_workspace_with_logo_returns_logo_url() {
     );
 
     remove_dir_if_exists(&existing_workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn workspace_code_graph_toggle_round_trips_through_add_and_save() {
+    let existing_workspace_dir =
+        env::temp_dir().join(unique_id("foco-existing-codegraph-toggle-workspace-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-codegraph-toggle-profile-test"));
+    let new_workspace_dir =
+        env::temp_dir().join(unique_id("foco-codegraph-toggle-new-workspace-test"));
+
+    fs::create_dir_all(&existing_workspace_dir).expect("existing workspace directory");
+    fs::create_dir_all(profile_dir.join(".foco")).expect("profile config directory");
+
+    // Old clients that omit the field deserialize as disabled (serde default).
+    let legacy_request: WorkspacePathRequest =
+        serde_json::from_str(r#"{"name":"Legacy","path":"/tmp/legacy"}"#)
+            .expect("legacy request deserializes");
+    assert!(!legacy_request.code_graph_enabled);
+    let explicit_request: WorkspacePathRequest = serde_json::from_str(
+        r#"{"name":"Explicit","path":"/tmp/explicit","codeGraphEnabled":true}"#,
+    )
+    .expect("explicit request deserializes");
+    assert!(explicit_request.code_graph_enabled);
+
+    let config = GlobalConfig::first_run(existing_workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+
+    let response = add_workspace(
+        State(state.clone()),
+        Json(WorkspacePathRequest {
+            name: "New Workspace".to_string(),
+            path: new_workspace_dir.display().to_string(),
+            server_id: None,
+            remote_path: None,
+            terminal_shell: None,
+            code_graph_enabled: true,
+            content_base64: None,
+        }),
+    )
+    .await
+    .expect("add workspace with code graph enabled");
+
+    let response = response.0;
+    let response_workspace = response
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.name == "New Workspace")
+        .expect("new workspace in settings response");
+    assert!(response_workspace.code_graph_enabled);
+
+    let workspace_id = response_workspace.id.clone();
+    let saved_config: GlobalConfig = serde_json::from_str(
+        &fs::read_to_string(&state.config_file).expect("saved config after add"),
+    )
+    .expect("deserialize saved config after add");
+    let saved_workspace = saved_config
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .expect("added workspace in saved config");
+    assert!(saved_workspace.code_graph_enabled);
+
+    // Editing the workspace can turn the toggle back off; the response and the
+    // persisted config both reflect the change.
+    let manual_request: ManualWorkspaceRequest = serde_json::from_value(serde_json::json!({
+        "id": workspace_id.clone(),
+        "name": "New Workspace",
+        "path": new_workspace_dir.display().to_string(),
+        "pinned": false,
+        "codeGraphEnabled": false,
+        "terminalShell": DEFAULT_TERMINAL_SHELL,
+        "commonCommands": [],
+    }))
+    .expect("manual workspace request deserializes");
+    let response = save_workspace_settings(State(state.clone()), Json(manual_request))
+        .await
+        .expect("save workspace with code graph disabled");
+
+    let response_workspace = response
+        .0
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .expect("saved workspace in settings response");
+    assert!(!response_workspace.code_graph_enabled);
+
+    let updated_config: GlobalConfig = serde_json::from_str(
+        &fs::read_to_string(&state.config_file).expect("saved config after edit"),
+    )
+    .expect("deserialize saved config after edit");
+    let updated_workspace = updated_config
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .expect("edited workspace in saved config");
+    assert!(!updated_workspace.code_graph_enabled);
+
+    remove_dir_if_exists(&existing_workspace_dir);
+    remove_dir_if_exists(&new_workspace_dir);
     remove_dir_if_exists(&profile_dir);
 }
 
@@ -31926,6 +32041,7 @@ async fn remote_ai_statistics_list_and_detail_derive_transport_from_ssh_audit_mi
             remote_path: "/srv/project".to_string(),
         },
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     });
@@ -34138,6 +34254,7 @@ description: Project memory.
         path: workspace_dir.clone(),
         location: WorkspaceLocation::Local,
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     }];
@@ -34442,6 +34559,7 @@ fn test_workspace_config(id: &str) -> WorkspaceConfig {
         path: env::temp_dir().join(id),
         location: WorkspaceLocation::Local,
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     }
@@ -39437,6 +39555,7 @@ async fn memory_move_local_success_preserves_fields_and_is_idempotent() {
             path: target_dir.clone(),
             location: WorkspaceLocation::Local,
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
             common_commands: Vec::new(),
         });
@@ -39446,6 +39565,7 @@ async fn memory_move_local_success_preserves_fields_and_is_idempotent() {
             path: other_dir.clone(),
             location: WorkspaceLocation::Local,
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
             common_commands: Vec::new(),
         });
@@ -40741,6 +40861,7 @@ async fn remote_ai_statistics_detail_http_reads_main_process_audit_mirror() {
             remote_path: "/srv/project".to_string(),
         },
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     });
@@ -40998,6 +41119,7 @@ async fn remote_workspace_proxy_forwards_bearer_token_and_common_chat_requests()
             remote_path: "/srv/project".to_string(),
         },
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     });
@@ -42232,6 +42354,7 @@ async fn html_preview_remote_proxies_sidecar_without_token_or_local_fallback() {
             remote_path: "/srv/project".to_string(),
         },
         pinned: false,
+        code_graph_enabled: false,
         terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
         common_commands: Vec::new(),
     });

@@ -1364,6 +1364,7 @@ mod tests {
                 remote_path: "/repo".to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "bash".to_string(),
             common_commands: Vec::new(),
         });

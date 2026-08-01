@@ -26481,6 +26481,7 @@ mod tests {
                 remote_path: remote_workspace.path().display().to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "bash".to_string(),
             common_commands: Vec::new(),
         });
@@ -28483,6 +28484,7 @@ mod tests {
                 path: self.workspace.path().to_path_buf(),
                 location: WorkspaceLocation::Local,
                 pinned: false,
+                code_graph_enabled: false,
                 terminal_shell: "/bin/sh".to_string(),
                 common_commands: Vec::new(),
             });
@@ -30103,6 +30105,7 @@ mod tests {
                 remote_path: remote_workspace.path().display().to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "bash".to_string(),
             common_commands: Vec::new(),
         });
@@ -35284,6 +35287,7 @@ mod tests {
                 remote_path: "/srv/project".to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "/bin/sh".to_string(),
             common_commands: Vec::new(),
         };
@@ -36705,6 +36709,7 @@ mod tests {
                 remote_path: "/srv/project".to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: foco_store::config::DEFAULT_TERMINAL_SHELL.to_string(),
             common_commands: Vec::new(),
         });
@@ -43477,6 +43482,7 @@ mod tests {
                 remote_path: "/remote/mcp".to_string(),
             },
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: "bash".to_string(),
             common_commands: Vec::new(),
         });

@@ -1450,6 +1450,7 @@ Body.",
             path: workspace_b.path().to_path_buf(),
             location: WorkspaceLocation::Local,
             pinned: false,
+            code_graph_enabled: false,
             terminal_shell: config.workspaces[0].terminal_shell.clone(),
             common_commands: Vec::new(),
         });
