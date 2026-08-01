@@ -3302,7 +3302,7 @@ fn chat_title_generation_model_selection_follows_live_active_provider() {
 }
 
 #[test]
-fn chat_title_generation_provider_request_uses_plain_text_small_output() {
+fn chat_title_generation_provider_request_uses_plain_text_bounded_output() {
     let request = crate::http::chat::chat_title_generation_provider_request(
         "model",
         "请帮我修一下远程 sidecar 安装并发的问题",
@@ -3311,7 +3311,7 @@ fn chat_title_generation_provider_request_uses_plain_text_small_output() {
     );
 
     assert_eq!(request.model_id, "model");
-    assert_eq!(request.max_output_tokens, Some(64));
+    assert_eq!(request.max_output_tokens, Some(1024));
     assert_eq!(request.thinking_level, None);
     assert!(request.tools.is_empty());
     assert!(request.messages[0].content.contains("English"));

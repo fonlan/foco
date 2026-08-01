@@ -1716,6 +1716,10 @@ mod required_single_tool_tests {
     use super::*;
     use crate::MEMORY_RETRIEVAL_TOOL_NAME;
     use crate::memory_runtime::tools::memory_retrieval_tool_definition;
+    use foco_providers::{OPENAI_CHAT_KIND, WebSearchMode};
+    use foco_store::config::{
+        ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, ModelLimits, ModelSettings, ProviderSettings,
+    };
 
     #[test]
     fn memory_retrieval_request_requires_select_relevant_memory() {
@@ -1732,5 +1736,65 @@ mod required_single_tool_tests {
             foco_providers::NeutralToolChoice::required_single_tool(MEMORY_RETRIEVAL_TOOL_NAME)
         );
         assert_eq!(request.tools, vec![memory_retrieval_tool_definition()]);
+    }
+
+    #[test]
+    fn memory_retrieval_provider_for_model_caps_output_at_memory_retrieval_limit() {
+        let chat_model = ModelSettings {
+            id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
+            developer_role_enabled: true,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(ModelLimits {
+                context_window: 100_000,
+                max_output_tokens: 8_192,
+            }),
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+        };
+        let chat_provider = ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: ApiProxySettings::default(),
+        };
+        let mut config = GlobalConfig::first_run(std::env::temp_dir());
+        config.models = vec![chat_model.clone()];
+        config.providers = vec![chat_provider.clone()];
+
+        let (model_id, _, _, max_output_tokens, _) =
+            memory_retrieval_provider_for_model(&config, &chat_model, &chat_provider)
+                .expect("retrieval provider");
+        assert_eq!(max_output_tokens, MEMORY_RETRIEVAL_MAX_OUTPUT_TOKENS);
+        assert_eq!(max_output_tokens, 4096);
+
+        let request = memory_retrieval_provider_request(
+            &model_id,
+            max_output_tokens,
+            "how does memory matching work?",
+            &[],
+            "system prompt",
+        )
+        .expect("retrieval request");
+        assert_eq!(
+            request.max_output_tokens,
+            Some(MEMORY_RETRIEVAL_MAX_OUTPUT_TOKENS)
+        );
     }
 }

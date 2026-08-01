@@ -319,7 +319,7 @@ Do not mention unstaged changes, model limitations, or that a diff was provided.
 // Maximum output tokens allowed for the memory extraction model request.
 const MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 2048;
 // Maximum output tokens allowed for the memory retrieval model request.
-const MEMORY_RETRIEVAL_MAX_OUTPUT_TOKENS: u32 = 1024;
+const MEMORY_RETRIEVAL_MAX_OUTPUT_TOKENS: u32 = 4096;
 // Maximum active or pending facts included for extraction-time duplicate checks.
 const MEMORY_EXTRACTION_EXISTING_FACT_LIMIT: u32 = 80;
 // Per-evidence content budget for background memory extraction requests.
