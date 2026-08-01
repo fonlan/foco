@@ -13,6 +13,7 @@ use foco_store::{
     },
     workspace::WorkspaceDatabase,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -870,9 +871,33 @@ pub(crate) async fn call_memory_retrieval_provider(
 pub(crate) fn parse_memory_extraction_output(
     value: Value,
 ) -> Result<MemoryExtractionOutput, ApiError> {
-    serde_json::from_value(value).map_err(|source| {
-        ApiError::bad_request(format!("malformed memory extraction JSON: {source}"))
-    })
+    parse_memory_json_output(value, "memory extraction")
+}
+
+/// Parse a structured memory LLM output, tolerating degraded providers that wrap the
+/// JSON payload in a plain string instead of calling the schema tool. When direct
+/// deserialization fails and the value is a string, the string content is unpacked as
+/// JSON and re-validated against the same schema. Failures keep the malformed error
+/// semantics (bad_request with a `malformed <kind> JSON:` message).
+fn parse_memory_json_output<T>(value: Value, kind: &str) -> Result<T, ApiError>
+where
+    T: DeserializeOwned,
+{
+    match serde_json::from_value(value.clone()) {
+        Ok(output) => Ok(output),
+        Err(direct_error) => {
+            if let Value::String(text) = &value {
+                if let Ok(inner) = serde_json::from_str::<Value>(text) {
+                    return serde_json::from_value(inner).map_err(|source| {
+                        ApiError::bad_request(format!("malformed {kind} JSON: {source}"))
+                    });
+                }
+            }
+            Err(ApiError::bad_request(format!(
+                "malformed {kind} JSON: {direct_error}"
+            )))
+        }
+    }
 }
 
 pub(crate) fn memory_extraction_error_should_be_ignored(error_message: Option<&str>) -> bool {
@@ -901,9 +926,7 @@ pub(crate) fn memory_extraction_ignore_reason(error_message: &str) -> &'static s
 pub(crate) fn parse_memory_retrieval_output(
     value: Value,
 ) -> Result<MemoryRetrievalOutput, ApiError> {
-    serde_json::from_value(value).map_err(|source| {
-        ApiError::bad_request(format!("malformed memory retrieval JSON: {source}"))
-    })
+    parse_memory_json_output(value, "memory retrieval")
 }
 
 pub(crate) fn store_extracted_memory_facts(

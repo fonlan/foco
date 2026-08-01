@@ -21944,6 +21944,37 @@ fn memory_extraction_rejects_malformed_json() {
 }
 
 #[test]
+fn memory_parse_accepts_string_wrapped_json() {
+    // Degraded providers may wrap the JSON payload in a plain string instead of
+    // calling the schema tool; the parser unpacks and re-validates it.
+    let extraction = parse_memory_extraction_output(json!(
+        r#"{"facts":[{"scope":"chat","kind":"preference","fact":"Prefer concise replies.","confidence":0.8,"relationCandidates":[],"evidenceReferences":[]}]}"#
+    ))
+    .expect("string-wrapped extraction JSON is valid");
+    assert_eq!(extraction.facts.len(), 1);
+
+    let retrieval = parse_memory_retrieval_output(json!(r#"{"factKeys":["pref-concise"]}"#))
+        .expect("string-wrapped retrieval JSON is valid");
+    assert_eq!(retrieval.fact_keys, vec!["pref-concise".to_string()]);
+}
+
+#[test]
+fn memory_parse_rejects_invalid_json_string() {
+    let error = parse_memory_extraction_output(json!("not json"))
+        .expect_err("non-JSON extraction string must fail");
+    assert!(error.message.contains("malformed memory extraction JSON"));
+
+    let error = parse_memory_retrieval_output(json!("{broken"))
+        .expect_err("non-JSON retrieval string must fail");
+    assert!(error.message.contains("malformed memory retrieval JSON"));
+
+    // String-wrapped but schema-invalid payloads must also keep malformed semantics.
+    let error = parse_memory_retrieval_output(json!(r#"{"unknownField":1}"#))
+        .expect_err("string-wrapped invalid retrieval schema must fail");
+    assert!(error.message.contains("malformed memory retrieval JSON"));
+}
+
+#[test]
 fn memory_extraction_rejects_missing_evidence() {
     let output = parse_memory_extraction_output(json!({
         "facts": [{
