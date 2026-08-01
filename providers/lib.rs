@@ -1467,6 +1467,9 @@ pub enum ToolChoiceEnforcement {
 ///
 /// Unsupported adapters (Ollama native protocol, Cohere, DeepSeek, Bedrock) keep tools +
 /// prompt only; callers must treat that as an explicit degradation, not silent enforcement.
+///
+/// Gateway adapters such as OpenCode Go / OpenRouter may still host DeepSeek models that
+/// reject `tool_choice`; use [`supports_required_single_tool`] with the upstream model id.
 pub fn adapter_supports_required_single_tool(adapter_kind: AdapterKind) -> bool {
     match adapter_kind {
         AdapterKind::OpenAI
@@ -1498,15 +1501,35 @@ pub fn adapter_supports_required_single_tool(adapter_kind: AdapterKind) -> bool 
     }
 }
 
-/// Resolve enforcement for a request against a concrete adapter.
+/// Whether the upstream model family rejects native forced `tool_choice`.
+///
+/// DeepSeek rejects the field whether reached via the native DeepSeek adapter or a
+/// gateway (OpenCode Go, OpenRouter, OpenAI-compatible proxies). Match whole path/name
+/// tokens so `deepseek-chat`, `deepseek/deepseek-v3`, and `provider/deepseek-r1` all hit.
+pub fn model_rejects_native_tool_choice(model_id: &str) -> bool {
+    model_id
+        .trim()
+        .to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|part| part == "deepseek")
+}
+
+/// Whether this adapter + upstream model can emit a native forced single-tool field.
+pub fn supports_required_single_tool(adapter_kind: AdapterKind, model_id: &str) -> bool {
+    adapter_supports_required_single_tool(adapter_kind)
+        && !model_rejects_native_tool_choice(model_id)
+}
+
+/// Resolve enforcement for a request against a concrete adapter and upstream model.
 pub fn resolve_tool_choice_enforcement(
     adapter_kind: AdapterKind,
     tool_choice: &NeutralToolChoice,
+    model_id: &str,
 ) -> ToolChoiceEnforcement {
     match tool_choice {
         NeutralToolChoice::Auto => ToolChoiceEnforcement::Auto,
         NeutralToolChoice::RequiredSingleTool { .. } => {
-            if adapter_supports_required_single_tool(adapter_kind) {
+            if supports_required_single_tool(adapter_kind, model_id) {
                 ToolChoiceEnforcement::Applied
             } else {
                 ToolChoiceEnforcement::UnsupportedDegraded
@@ -2858,7 +2881,7 @@ fn genai_chat_options_with_runtime_options(
         options = options.with_cache_control(cache_control);
     }
 
-    options = apply_neutral_tool_choice(options, config.kind.adapter_kind(), request)?;
+    options = apply_neutral_tool_choice(options, config.kind.adapter_kind(), model_id, request)?;
 
     apply_request_overrides_and_agent_headers(options, config, request, runtime_options)
 }
@@ -2870,6 +2893,7 @@ fn genai_chat_options_with_runtime_options(
 fn apply_neutral_tool_choice(
     mut options: ChatOptions,
     adapter_kind: AdapterKind,
+    model_id: &str,
     request: &NeutralChatRequest,
 ) -> Result<ChatOptions, ProviderConfigError> {
     let NeutralToolChoice::RequiredSingleTool { tool_name } = &request.tool_choice else {
@@ -2888,7 +2912,7 @@ fn apply_neutral_tool_choice(
         )));
     }
 
-    match resolve_tool_choice_enforcement(adapter_kind, &request.tool_choice) {
+    match resolve_tool_choice_enforcement(adapter_kind, &request.tool_choice, model_id) {
         ToolChoiceEnforcement::Applied => {
             options = options.with_tool_choice(GenaiToolChoice::tool(tool_name));
             Ok(options)
@@ -2896,8 +2920,9 @@ fn apply_neutral_tool_choice(
         ToolChoiceEnforcement::UnsupportedDegraded => {
             tracing::warn!(
                 adapter = adapter_kind.as_str(),
+                model = model_id,
                 tool_name,
-                "RequiredSingleTool requested but adapter does not support native forced tool choice; degrading to tools + prompt (+ repair retry)"
+                "RequiredSingleTool requested but adapter/model does not support native forced tool choice; degrading to tools + prompt (+ repair retry)"
             );
             Ok(options)
         }
@@ -8025,61 +8050,109 @@ mod tests {
     #[test]
     fn required_single_tool_enforcement_matrix() {
         assert_eq!(
-            resolve_tool_choice_enforcement(AdapterKind::OpenAIResp, &NeutralToolChoice::Auto),
+            resolve_tool_choice_enforcement(
+                AdapterKind::OpenAIResp,
+                &NeutralToolChoice::Auto,
+                "gpt-4.1-mini"
+            ),
             ToolChoiceEnforcement::Auto
         );
         assert_eq!(
-            resolve_tool_choice_enforcement(AdapterKind::DeepSeek, &NeutralToolChoice::Auto),
+            resolve_tool_choice_enforcement(
+                AdapterKind::DeepSeek,
+                &NeutralToolChoice::Auto,
+                "deepseek-chat"
+            ),
             ToolChoiceEnforcement::Auto
         );
         assert_eq!(
             resolve_tool_choice_enforcement(
                 AdapterKind::OpenAIResp,
-                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+                &NeutralToolChoice::required_single_tool("select_relevant_memory"),
+                "gpt-4.1-mini"
             ),
             ToolChoiceEnforcement::Applied
         );
         assert_eq!(
             resolve_tool_choice_enforcement(
                 AdapterKind::Anthropic,
-                &NeutralToolChoice::required_single_tool("submit_memory_extraction")
+                &NeutralToolChoice::required_single_tool("submit_memory_extraction"),
+                "claude-sonnet-4"
             ),
             ToolChoiceEnforcement::Applied
         );
         assert_eq!(
             resolve_tool_choice_enforcement(
                 AdapterKind::Gemini,
-                &NeutralToolChoice::required_single_tool("submit_workspace_spec_update")
+                &NeutralToolChoice::required_single_tool("submit_workspace_spec_update"),
+                "gemini-2.5-pro"
             ),
             ToolChoiceEnforcement::Applied
         );
         assert_eq!(
             resolve_tool_choice_enforcement(
                 AdapterKind::Ollama,
-                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+                &NeutralToolChoice::required_single_tool("select_relevant_memory"),
+                "llama3.2"
             ),
             ToolChoiceEnforcement::UnsupportedDegraded
         );
         assert_eq!(
             resolve_tool_choice_enforcement(
                 AdapterKind::Cohere,
-                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+                &NeutralToolChoice::required_single_tool("select_relevant_memory"),
+                "command-r"
             ),
             ToolChoiceEnforcement::UnsupportedDegraded
         );
         assert_eq!(
             resolve_tool_choice_enforcement(
                 AdapterKind::BedrockApi,
-                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+                &NeutralToolChoice::required_single_tool("select_relevant_memory"),
+                "anthropic.claude-3"
             ),
             ToolChoiceEnforcement::UnsupportedDegraded
         );
         assert_eq!(
             resolve_tool_choice_enforcement(
                 AdapterKind::DeepSeek,
-                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+                &NeutralToolChoice::required_single_tool("select_relevant_memory"),
+                "deepseek-chat"
             ),
             ToolChoiceEnforcement::UnsupportedDegraded
+        );
+        // Gateway adapters still host DeepSeek models that reject tool_choice.
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::OpenCodeGo,
+                &NeutralToolChoice::required_single_tool("select_relevant_memory"),
+                "deepseek-chat"
+            ),
+            ToolChoiceEnforcement::UnsupportedDegraded
+        );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::OpenCodeGo,
+                &NeutralToolChoice::required_single_tool("select_relevant_memory"),
+                "deepseek/deepseek-v3"
+            ),
+            ToolChoiceEnforcement::UnsupportedDegraded
+        );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::OpenRouter,
+                &NeutralToolChoice::required_single_tool("select_relevant_memory"),
+                "deepseek/deepseek-r1"
+            ),
+            ToolChoiceEnforcement::UnsupportedDegraded
+        );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::OpenCodeGo,
+                &NeutralToolChoice::required_single_tool("select_relevant_memory"),
+                "minimax-m2"
+            ),
+            ToolChoiceEnforcement::Applied
         );
         assert!(!adapter_supports_required_single_tool(
             AdapterKind::OllamaCloud
@@ -8088,6 +8161,20 @@ mod tests {
             AdapterKind::DeepSeek
         ));
         assert!(adapter_supports_required_single_tool(AdapterKind::OpenAI));
+        assert!(adapter_supports_required_single_tool(
+            AdapterKind::OpenCodeGo
+        ));
+        assert!(model_rejects_native_tool_choice("deepseek-chat"));
+        assert!(model_rejects_native_tool_choice("deepseek/deepseek-v3"));
+        assert!(!model_rejects_native_tool_choice("minimax-m2"));
+        assert!(!supports_required_single_tool(
+            AdapterKind::OpenCodeGo,
+            "deepseek-chat"
+        ));
+        assert!(supports_required_single_tool(
+            AdapterKind::OpenCodeGo,
+            "minimax-m2"
+        ));
     }
 
     #[test]
@@ -8145,7 +8232,11 @@ mod tests {
             model_redirects: Vec::new(),
         };
         assert_eq!(
-            resolve_tool_choice_enforcement(config.kind.adapter_kind(), &request.tool_choice),
+            resolve_tool_choice_enforcement(
+                config.kind.adapter_kind(),
+                &request.tool_choice,
+                &request.model_id
+            ),
             ToolChoiceEnforcement::UnsupportedDegraded
         );
         let options = genai_chat_options(&config, &request).expect("options");
@@ -8288,6 +8379,61 @@ mod tests {
         assert!(
             body_json.get("tool_choice").is_none(),
             "DeepSeek must receive tools + prompt degradation without native tool_choice"
+        );
+        assert_eq!(
+            body_json["tools"][0]["function"]["name"],
+            "select_relevant_memory"
+        );
+
+        while stream.next_event().await.is_some() {}
+        let _ = fixture.await;
+    }
+
+    #[tokio::test]
+    async fn required_single_tool_omits_tool_choice_on_opencode_go_deepseek_wire() {
+        let response = concat!(
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\\n\\n",
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\\n\\n",
+            "data: [DONE]\\n\\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENCODE_GO_KIND).expect("opencode-go kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "use the tool",
+        )]);
+        request.model_id = "deepseek-chat".to_string();
+        request.tools.push(NeutralToolDefinition {
+            name: "select_relevant_memory".to_string(),
+            description: "pick memories".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            strict: true,
+            kind: NeutralToolKind::Function,
+        });
+        request.tool_choice = NeutralToolChoice::required_single_tool("select_relevant_memory");
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .as_http()
+            .expect("http request dump")
+            .clone();
+        let body = dump.body.as_deref().expect("request body");
+        let body_json: Value = serde_json::from_str(body).expect("request JSON");
+        assert!(
+            body_json.get("tool_choice").is_none(),
+            "OpenCode Go DeepSeek must receive tools + prompt degradation without native tool_choice"
         );
         assert_eq!(
             body_json["tools"][0]["function"]["name"],
