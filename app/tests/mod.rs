@@ -2238,106 +2238,7 @@ fn tray_menu_labels_follow_app_language() {
 }
 
 #[test]
-fn background_code_graph_initialization_indexes_workspace_and_keeps_watcher() {
-    let workspace_dir = env::temp_dir().join(unique_id("foco-background-graph-test"));
-    remove_dir_if_exists(&workspace_dir);
-    fs::create_dir_all(&workspace_dir).expect("workspace directory");
-    fs::write(
-        workspace_dir.join("lib.rs"),
-        "pub fn helper() -> i32 { 1 }\n",
-    )
-    .expect("workspace source write");
-    let workspaces = vec![WorkspaceConfig {
-        id: "workspace-1".to_string(),
-        name: "Workspace 1".to_string(),
-        path: workspace_dir.clone(),
-        location: WorkspaceLocation::Local,
-        pinned: false,
-        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
-        common_commands: Vec::new(),
-    }];
-    let indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
-
-    let thread = spawn_code_graph_index_initialization(workspaces, indexes.clone())
-        .expect("spawn code graph initialization");
-    thread.join().expect("code graph initialization thread");
-
-    assert_eq!(
-        indexes
-            .lock()
-            .expect("code graph index lock")
-            .watcher_count(),
-        1,
-        "watcher must be retained after background indexing"
-    );
-    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
-    let context = database.code_graph_context().expect("code graph context");
-    assert_eq!(context.indexed_files, 1);
-    drop(database);
-    indexes
-        .lock()
-        .expect("code graph index lock")
-        .clear_watchers();
-    remove_dir_if_exists(&workspace_dir);
-}
-
-#[test]
-fn startup_code_graph_initialization_selects_recently_active_workspaces() {
-    let active_dir = env::temp_dir().join(unique_id("foco-active-graph-test"));
-    let inactive_dir = env::temp_dir().join(unique_id("foco-inactive-graph-test"));
-    remove_dir_if_exists(&active_dir);
-    remove_dir_if_exists(&inactive_dir);
-    fs::create_dir_all(&active_dir).expect("active workspace directory");
-    fs::create_dir_all(&inactive_dir).expect("inactive workspace directory");
-
-    let active_workspace = WorkspaceConfig {
-        id: "active-workspace".to_string(),
-        name: "Active Workspace".to_string(),
-        path: active_dir.clone(),
-        location: WorkspaceLocation::Local,
-        pinned: false,
-        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
-        common_commands: Vec::new(),
-    };
-    let inactive_workspace = WorkspaceConfig {
-        id: "inactive-workspace".to_string(),
-        name: "Inactive Workspace".to_string(),
-        path: inactive_dir.clone(),
-        location: WorkspaceLocation::Local,
-        pinned: false,
-        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
-        common_commands: Vec::new(),
-    };
-
-    let mut active_database = WorkspaceDatabase::open_or_create(&active_dir).expect("active db");
-    active_database
-        .insert_chat("chat-active", "Active chat")
-        .expect("active chat");
-    active_database
-        .insert_message(NewMessage {
-            id: "msg-active-user",
-            chat_id: "chat-active",
-            role: "user",
-            content: "Index this workspace",
-            sequence: 0,
-            metadata_json: None,
-        })
-        .expect("active user message");
-    drop(active_database);
-    WorkspaceDatabase::open_or_create(&inactive_dir).expect("inactive db");
-
-    let workspaces = vec![active_workspace.clone(), inactive_workspace];
-    let selected = recently_active_code_graph_workspaces(&workspaces)
-        .expect("recently active code graph workspaces");
-
-    assert_eq!(selected, vec![active_workspace]);
-
-    remove_dir_if_exists(&active_dir);
-    remove_dir_if_exists(&inactive_dir);
-}
-
-#[test]
-fn lazy_code_graph_initialization_indexes_workspace_once() {
+fn code_graph_execution_root_initialization_indexes_workspace_once() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-lazy-graph-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-lazy-graph-profile"));
     remove_dir_if_exists(&workspace_dir);
@@ -2351,10 +2252,13 @@ fn lazy_code_graph_initialization_indexes_workspace_once() {
     .expect("workspace source write");
 
     let config = GlobalConfig::first_run(workspace_dir.clone());
-    let workspace = config.workspaces[0].clone();
     let state = test_app_state(config, profile_dir.clone());
 
-    spawn_code_graph_workspace_initialization_if_needed(&state, &workspace);
+    crate::runtime::spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        workspace_dir.clone(),
+        "test-demand-graph-tool",
+    );
     wait_for_code_graph_watchers(&state.code_graph_indexes, 1);
 
     let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
@@ -2362,7 +2266,11 @@ fn lazy_code_graph_initialization_indexes_workspace_once() {
     assert_eq!(context.indexed_files, 1);
     drop(database);
 
-    spawn_code_graph_workspace_initialization_if_needed(&state, &workspace);
+    crate::runtime::spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        workspace_dir.clone(),
+        "test-demand-graph-tool-repeat",
+    );
     assert_eq!(
         state
             .code_graph_indexes
@@ -2370,7 +2278,7 @@ fn lazy_code_graph_initialization_indexes_workspace_once() {
             .expect("code graph index lock")
             .watcher_count(),
         1,
-        "lazy initialization should not register duplicate watchers"
+        "demand initialization should not register duplicate watchers"
     );
 
     state

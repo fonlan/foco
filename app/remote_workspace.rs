@@ -10380,6 +10380,7 @@ fn ensure_sidecar_code_graph(
     )
 }
 
+#[cfg(test)]
 fn prewarm_sidecar_code_graph_execution_root(
     state: &RemoteSidecarState,
     execution_root: &Path,
@@ -21284,15 +21285,6 @@ async fn remote_sidecar_start_chat_run(
             wait_resume,
         )
     };
-    // Prewarm only after the chat and, when present, Plan task binding have
-    // confirmed ownership of this execution root. The first Graph tool then
-    // waits for this same-path single-flight initialization rather than starting
-    // a cold index itself.
-    prewarm_sidecar_code_graph_execution_root(
-        &state,
-        &tool_workspace_path,
-        format!("remote-chat:{chat_id}"),
-    );
     if plan_task
         .as_ref()
         .is_some_and(|binding| !binding.lifecycle.allows_memory_retrieval())
@@ -43520,14 +43512,15 @@ mod tests {
         .expect("worktree source");
 
         let (state, catalog) = test_remote_sidecar_local_catalog(&workspace_path, None).await;
-
-        // Prewarm the isolated execution root the same way chat-run startup does.
-        prewarm_sidecar_code_graph_execution_root(
-            &state,
-            &worktree.root_path,
-            "test-remote-worktree-prewarm",
+        assert_eq!(
+            state
+                .code_graph_indexes
+                .lock()
+                .expect("code graph index lock")
+                .watcher_count(),
+            0,
+            "ordinary remote-sidecar setup must not prewarm the isolated execution root"
         );
-        wait_for_remote_code_graph_watchers(&state.code_graph_indexes, 1);
 
         let (symbols, symbols_error, _, _) = test_execute_remote_sidecar_local_tool_at_workspace(
             &state,
@@ -43554,6 +43547,15 @@ mod tests {
         assert!(
             !symbols_text.contains("shared_only_symbol"),
             "worktree graph must not surface shared-only symbols: {symbols}"
+        );
+        assert_eq!(
+            state
+                .code_graph_indexes
+                .lock()
+                .expect("code graph index lock")
+                .watcher_count(),
+            1,
+            "the first graph tool call must demand-start exactly one worktree graph"
         );
 
         let worktree_db =

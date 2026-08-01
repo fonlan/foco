@@ -1,12 +1,14 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, UNIX_EPOCH},
@@ -159,17 +161,15 @@ use crate::runtime::{
     default_guidance_source, detect_ripgrep, execute_tool_calls_parallel, image_model_available,
     insert_agent_event, is_agent_tool_name, is_automatic_guard_source,
     open_workspace_database_ordinary_with_pre_stream_retry, pending_tool_calls,
-    reasoning_loop_guard_message, recently_active_code_graph_workspaces, ripgrep_tool_summary,
-    run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
-    spawn_code_graph_index_initialization, try_register_implicit_wait_for_undelivered_children,
+    reasoning_loop_guard_message, ripgrep_tool_summary, run_chat_context_in_background,
+    spawn_api_audit_cleanup_scheduler, try_register_implicit_wait_for_undelivered_children,
     validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
 pub(crate) use crate::runtime::{
     CodeGraphReadinessError, GithubReleaseAsset, agent_wait_resume_messages,
     reconcile_agent_runtime, ripgrep_asset_target, ripgrep_executable_name, ripgrep_install_dir,
-    select_ripgrep_asset, spawn_code_graph_workspace_initialization_if_needed,
-    wait_for_code_graph_ready,
+    select_ripgrep_asset, wait_for_code_graph_ready,
 };
 #[cfg(test)]
 use crate::runtime::{ReadOnlyToolProgressDetector, RepeatedToolCallDetector};
@@ -779,8 +779,6 @@ async fn run_server_until_shutdown(
         elapsed_ms = frontend_assets_started_at.elapsed().as_millis() as u64,
         "frontend asset verification completed"
     );
-    let code_graph_workspaces =
-        recently_active_code_graph_workspaces(&loaded_config.config.workspaces)?;
     let code_graph_indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
     let (terminal_shutdown_tx, _) = broadcast::channel(16);
     let (owned_shutdown_tx, owned_shutdown_rx);
@@ -911,9 +909,6 @@ async fn run_server_until_shutdown(
             crate::platform::tray::open_foco_ui,
         );
     }
-    let _code_graph_index_thread =
-        spawn_code_graph_index_initialization(code_graph_workspaces, code_graph_indexes)?;
-
     tracing::info!(
         %listen_addr,
         elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
@@ -2577,10 +2572,6 @@ impl PromptAssemblyPurpose {
     }
 
     fn allows_memory_mutation(self) -> bool {
-        matches!(self, Self::ChatRun)
-    }
-
-    fn allows_code_graph_initialization(self) -> bool {
         matches!(self, Self::ChatRun)
     }
 

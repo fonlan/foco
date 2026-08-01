@@ -19157,6 +19157,114 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    /// Replaces resolver-derived rows only for imports and call sites owned by
+    /// the supplied source files. This lets a changed dependency update its
+    /// importers without invalidating unrelated resolver results.
+    pub fn replace_code_graph_import_resolutions_for_files(
+        &mut self,
+        source_file_ids: &[i64],
+        resolutions: &[NewCodeGraphImportResolution<'_>],
+        calls: &[NewCodeGraphResolvedCall<'_>],
+    ) -> Result<(), WorkspaceDatabaseError> {
+        if source_file_ids.is_empty() {
+            return Ok(());
+        }
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| WorkspaceDatabaseError::Sqlite {
+                path: database_path.clone(),
+                source,
+            })?;
+        let placeholders = std::iter::repeat_n("?", source_file_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let delete_calls = format!(
+            "DELETE FROM code_graph_edges
+             WHERE edge_kind = 'calls'
+               AND json_extract(metadata_json, '$.provenance') = 'module_resolver'
+               AND source_symbol_id IN (
+                   SELECT id FROM code_graph_symbols WHERE file_id IN ({placeholders})
+               )"
+        );
+        transaction
+            .execute(&delete_calls, params_from_iter(source_file_ids.iter()))
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let delete_resolutions = format!(
+            "DELETE FROM code_graph_import_resolutions
+             WHERE import_id IN (
+                 SELECT id FROM code_graph_imports WHERE file_id IN ({placeholders})
+             )"
+        );
+        transaction
+            .execute(
+                &delete_resolutions,
+                params_from_iter(source_file_ids.iter()),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let now = now_timestamp();
+        let mut insert_resolution = transaction
+            .prepare(
+                "INSERT INTO code_graph_import_resolutions
+                    (import_id, resolution, target_file_id, target_symbol_id, candidates_json, metadata_json, resolved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let mut insert_candidate = transaction
+            .prepare(
+                "INSERT INTO code_graph_import_resolution_candidates
+                    (import_id, target_file_id, target_symbol_id)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        for resolution in resolutions {
+            insert_resolution
+                .execute(params![
+                    resolution.import_id,
+                    resolution.resolution,
+                    resolution.target_file_id,
+                    resolution.target_symbol_id,
+                    resolution.candidates_json,
+                    resolution.metadata_json,
+                    now
+                ])
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            for candidate in resolution.candidates {
+                insert_candidate
+                    .execute(params![
+                        resolution.import_id,
+                        candidate.target_file_id,
+                        candidate.target_symbol_id
+                    ])
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
+        }
+        let mut insert_call = transaction
+            .prepare(
+                "INSERT INTO code_graph_edges
+                    (source_symbol_id, target_symbol_id, edge_kind, metadata_json)
+                 VALUES (?1, ?2, 'calls', ?3)",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        for call in calls {
+            insert_call
+                .execute(params![
+                    call.source_symbol_id,
+                    call.target_symbol_id,
+                    call.metadata_json
+                ])
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        drop(insert_call);
+        drop(insert_candidate);
+        drop(insert_resolution);
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(())
+    }
+
     pub fn code_graph_imports(
         &self,
         path: &str,
@@ -19236,6 +19344,39 @@ impl WorkspaceDatabase {
             .query_map(params![path, limit], code_graph_import_from_row)
             .map_err(|source| self.sqlite_error(source))?;
 
+        collect_rows(rows, &self.database_path)
+    }
+
+    /// Return source paths whose cached resolver output references `path` as an
+    /// exact or candidate target. This is internal invalidation data, so unlike
+    /// `code_graph_importers` it deliberately includes candidates.
+    pub fn code_graph_resolution_dependent_paths(
+        &self,
+        path: &str,
+    ) -> Result<Vec<String>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT DISTINCT source_file.path AS dependent_path
+                 FROM code_graph_import_resolutions resolution
+                 JOIN code_graph_imports import ON import.id = resolution.import_id
+                 JOIN code_graph_files source_file ON source_file.id = import.file_id
+                 JOIN code_graph_files target_file ON target_file.id = resolution.target_file_id
+                 WHERE target_file.path = ?1
+                 UNION
+                 SELECT DISTINCT source_file.path AS dependent_path
+                 FROM code_graph_import_resolution_candidates candidate
+                 JOIN code_graph_import_resolutions resolution ON resolution.import_id = candidate.import_id
+                 JOIN code_graph_imports import ON import.id = resolution.import_id
+                 JOIN code_graph_files source_file ON source_file.id = import.file_id
+                 JOIN code_graph_files target_file ON target_file.id = candidate.target_file_id
+                 WHERE target_file.path = ?1
+                 ORDER BY dependent_path ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![path], |row| row.get::<_, String>(0))
+            .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
     }
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs, io,
     path::{Component, Path, PathBuf},
     time::{Instant, SystemTime},
@@ -31,7 +31,6 @@ pub(crate) fn index_workspace(workspace_path: &Path) -> Result<IndexReport, Code
         let database = WorkspaceDatabase::open_or_create(&workspace_path)?;
         database.code_graph_file_hashes()?
     };
-
     let mut report = IndexReport::default();
     let mut live_paths = Vec::new();
     let mut pending_writes = Vec::new();
@@ -93,6 +92,135 @@ pub(crate) fn index_workspace(workspace_path: &Path) -> Result<IndexReport, Code
     report.resolver_duration_us = duration_micros(resolver_started_at.elapsed());
 
     Ok(report)
+}
+
+/// Refreshes a bounded, caller-provided set of workspace paths without walking
+/// the workspace. Watchers use this for ordinary source saves; full discovery
+/// remains the recovery path for unclassifiable filesystem events.
+pub(crate) fn index_workspace_paths(
+    workspace_path: &Path,
+    dirty_paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<IndexReport, CodeGraphError> {
+    let workspace_path = canonical_workspace_path(workspace_path)?;
+    let mut files = dirty_paths
+        .into_iter()
+        .filter_map(|path| normalize_dirty_path(&workspace_path, &path))
+        .filter(|path| should_consider_watch_path(&workspace_path, path))
+        .collect::<Vec<_>>();
+    files.sort();
+    files.dedup();
+
+    let existing_hashes = {
+        let database = WorkspaceDatabase::open_or_create(&workspace_path)?;
+        database.code_graph_file_hashes()?
+    };
+    let resolver_dependents = {
+        let database = WorkspaceDatabase::open_or_create(&workspace_path)?;
+        let mut dependents = HashMap::new();
+        for file_path in &files {
+            let relative_path = workspace_relative_path(&workspace_path, file_path)?;
+            let paths = database.code_graph_resolution_dependent_paths(&relative_path)?;
+            dependents.insert(relative_path, paths);
+        }
+        dependents
+    };
+    let mut report = IndexReport::default();
+    let mut pending_writes = Vec::new();
+    let mut affected_paths = HashSet::new();
+    let mut requires_full_resolver = false;
+
+    for file_path in files {
+        report.scanned_files = report.scanned_files.saturating_add(1);
+        let relative_path = workspace_relative_path(&workspace_path, &file_path)?;
+        let prepare_started_at = Instant::now();
+        match fs::metadata(&file_path) {
+            Ok(metadata) if metadata.is_file() => {
+                if !existing_hashes.contains_key(&relative_path) {
+                    // A newly created target can satisfy imports that were
+                    // previously unresolved, so its complete impact is not
+                    // represented by durable reverse-resolution rows yet.
+                    requires_full_resolver = true;
+                }
+                let prepared =
+                    prepare_workspace_file(&workspace_path, &file_path, &existing_hashes)?;
+                report.file_prepare_duration_us = report
+                    .file_prepare_duration_us
+                    .saturating_add(duration_micros(prepare_started_at.elapsed()));
+                match prepared {
+                    FilePrepareOutcome::Indexed(prepared) => {
+                        if prepared.had_parse_error {
+                            report.parse_errors = report.parse_errors.saturating_add(1);
+                        }
+                        pending_writes.push(*prepared);
+                        affected_paths.insert(relative_path.clone());
+                        if let Some(dependents) = resolver_dependents.get(&relative_path) {
+                            affected_paths.extend(dependents.iter().cloned());
+                        }
+                        report.indexed_files = report.indexed_files.saturating_add(1);
+                    }
+                    FilePrepareOutcome::Unchanged { .. } => {
+                        report.unchanged_files = report.unchanged_files.saturating_add(1);
+                    }
+                    FilePrepareOutcome::Skipped => {
+                        report.skipped_files = report.skipped_files.saturating_add(1);
+                    }
+                }
+            }
+            Ok(_) => {
+                // Directories are filtered by the watcher while they exist. A
+                // directory that disappeared before the callback is handled by
+                // the safe full-refresh fallback in the watcher instead.
+                report.skipped_files = report.skipped_files.saturating_add(1);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // Deletion can invalidate exact, candidate, and unresolved
+                // import state. Use the full resolver as the correctness path.
+                requires_full_resolver = true;
+                let write_started_at = Instant::now();
+                let mut database = WorkspaceDatabase::open_or_create(&workspace_path)?;
+                if database.delete_code_graph_file(&relative_path)? {
+                    report.deleted_files = report.deleted_files.saturating_add(1);
+                }
+                report.sqlite_persistence_duration_us = report
+                    .sqlite_persistence_duration_us
+                    .saturating_add(duration_micros(write_started_at.elapsed()));
+            }
+            Err(source) => return Err(io_error(&file_path, source)),
+        }
+    }
+
+    if !pending_writes.is_empty() {
+        let write_started_at = Instant::now();
+        flush_prepared_indexes(&workspace_path, &mut pending_writes)?;
+        report.sqlite_persistence_duration_us = report
+            .sqlite_persistence_duration_us
+            .saturating_add(duration_micros(write_started_at.elapsed()));
+    }
+
+    let resolver_started_at = Instant::now();
+    if requires_full_resolver {
+        crate::resolver::resolve_workspace_imports(&workspace_path)?;
+    } else {
+        crate::resolver::resolve_workspace_imports_for_paths(&workspace_path, &affected_paths)?;
+    }
+    report.resolver_duration_us = duration_micros(resolver_started_at.elapsed());
+
+    Ok(report)
+}
+
+fn normalize_dirty_path(workspace_path: &Path, path: &Path) -> Option<PathBuf> {
+    if path.starts_with(workspace_path) {
+        return Some(path.to_path_buf());
+    }
+
+    // macOS exposes `/var` as a symlink to `/private/var`; watcher callbacks
+    // and callers can therefore use a spelling that differs from the canonical
+    // workspace root. Canonicalizing the parent also works after a file delete.
+    let parent = path.parent()?;
+    let file_name = path.file_name()?;
+    let canonical_parent = fs::canonicalize(parent).ok()?;
+    let normalized = canonical_parent.join(file_name);
+    normalized.starts_with(workspace_path).then_some(normalized)
 }
 
 fn duration_micros(duration: std::time::Duration) -> u64 {

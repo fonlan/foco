@@ -65,6 +65,67 @@ pub(crate) fn resolve_workspace_imports(
     Ok(())
 }
 
+/// Re-resolves only imports and resolver-derived call edges whose source files
+/// are known to be affected. File/symbol lookup still uses a consistent graph
+/// snapshot, so target selection keeps the same semantics as a full rebuild.
+pub(crate) fn resolve_workspace_imports_for_paths(
+    workspace_path: &std::path::Path,
+    affected_paths: &HashSet<String>,
+) -> Result<(), CodeGraphError> {
+    if affected_paths.is_empty() {
+        return Ok(());
+    }
+    let mut snapshot = {
+        let database = WorkspaceDatabase::open_or_create(workspace_path)?;
+        database.code_graph_resolver_snapshot()?
+    };
+    let affected_file_ids = snapshot
+        .files
+        .iter()
+        .filter(|file| affected_paths.contains(&file.path))
+        .map(|file| file.id)
+        .collect::<HashSet<_>>();
+    if affected_file_ids.is_empty() {
+        return Ok(());
+    }
+    snapshot
+        .imports
+        .retain(|import| affected_file_ids.contains(&import.file_id));
+    snapshot
+        .references
+        .retain(|reference| affected_file_ids.contains(&reference.file_id));
+    let (resolutions, calls) = resolve_snapshot(&snapshot);
+    let borrowed_resolutions = resolutions
+        .iter()
+        .map(|resolution| NewCodeGraphImportResolution {
+            import_id: resolution.import_id,
+            resolution: resolution.resolution,
+            target_file_id: resolution.target_file_id,
+            target_symbol_id: resolution.target_symbol_id,
+            candidates: &resolution.candidates,
+            candidates_json: &resolution.candidates_json,
+            metadata_json: &resolution.metadata_json,
+        })
+        .collect::<Vec<_>>();
+    let borrowed_calls = calls
+        .iter()
+        .map(
+            |(source_symbol_id, target_symbol_id)| NewCodeGraphResolvedCall {
+                source_symbol_id: *source_symbol_id,
+                target_symbol_id: *target_symbol_id,
+                metadata_json: MODULE_RESOLVER_EXACT_CALL,
+            },
+        )
+        .collect::<Vec<_>>();
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)?;
+    database.replace_code_graph_import_resolutions_for_files(
+        &affected_file_ids.into_iter().collect::<Vec<_>>(),
+        &borrowed_resolutions,
+        &borrowed_calls,
+    )?;
+    Ok(())
+}
+
 fn resolve_snapshot(
     snapshot: &CodeGraphResolverSnapshot,
 ) -> (Vec<OwnedResolution>, Vec<(i64, i64)>) {

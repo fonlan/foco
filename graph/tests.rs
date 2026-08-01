@@ -16,7 +16,7 @@ use crate::{
             ExtractedEdge, ExtractedEdgeTarget, ExtractedPosition, file_local_key, node_local_key,
         },
     },
-    index_workspace,
+    index_workspace, index_workspace_paths,
 };
 
 #[test]
@@ -252,6 +252,97 @@ fn indexes_workspace_incrementally_and_records_syntax_confirmed_calls() {
             "SELECT COUNT(*) FROM code_graph_references WHERE name = 'helper'",
         ),
         1
+    );
+}
+
+#[test]
+fn dirty_path_index_reads_and_reparses_only_the_changed_source_file() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let changed_path = workspace.path().join("src/changed.rs");
+    let untouched_path = workspace.path().join("src/untouched.rs");
+    fs::create_dir_all(changed_path.parent().expect("source parent")).expect("source directory");
+    fs::write(&changed_path, "pub fn before() {}\n").expect("changed source");
+    fs::write(&untouched_path, "pub fn untouched() {}\n").expect("untouched source");
+    index_workspace(workspace.path()).expect("initial index");
+
+    fs::write(&changed_path, "pub fn after() {}\n").expect("updated source");
+    let report = index_workspace_paths(workspace.path(), [changed_path])
+        .expect("incremental dirty-path index");
+    let connection = graph_connection(workspace.path());
+
+    assert_eq!(report.scanned_files, 1);
+    assert_eq!(report.indexed_files, 1);
+    assert_eq!(
+        query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_symbols WHERE qualified_name = 'after'",
+        ),
+        1
+    );
+    assert_eq!(
+        query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_symbols WHERE qualified_name = 'untouched'",
+        ),
+        1
+    );
+}
+
+#[test]
+fn dirty_path_index_removes_deleted_file_rows_without_a_workspace_walk() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source_path = workspace.path().join("removed.rs");
+    fs::write(&source_path, "pub fn removed() {}\n").expect("source");
+    index_workspace(workspace.path()).expect("initial index");
+
+    fs::remove_file(&source_path).expect("delete source");
+    let report =
+        index_workspace_paths(workspace.path(), [source_path]).expect("incremental delete");
+    let connection = graph_connection(workspace.path());
+
+    assert_eq!(report.scanned_files, 1);
+    assert_eq!(report.deleted_files, 1);
+    assert_eq!(
+        query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_files WHERE path = 'removed.rs'"
+        ),
+        0
+    );
+}
+
+#[test]
+fn dirty_path_index_re_resolves_importers_of_a_modified_target() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source_dir = workspace.path().join("src");
+    fs::create_dir_all(&source_dir).expect("source directory");
+    let consumer_path = source_dir.join("consumer.ts");
+    let producer_path = source_dir.join("producer.ts");
+    fs::write(
+        &consumer_path,
+        "import { value } from './producer';\nexport function caller() { return value(); }\n",
+    )
+    .expect("consumer source");
+    fs::write(&producer_path, "export function value() { return 1; }\n").expect("producer source");
+    index_workspace(workspace.path()).expect("initial index");
+
+    fs::write(&producer_path, "export function renamed() { return 1; }\n")
+        .expect("modified producer");
+    let report = index_workspace_paths(workspace.path(), [producer_path])
+        .expect("incremental target update");
+    let connection = graph_connection(workspace.path());
+
+    assert_eq!(report.scanned_files, 1);
+    assert_eq!(
+        query_count(
+            &connection,
+            "SELECT COUNT(*)
+             FROM code_graph_edges edge
+             JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+             JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+             WHERE source.file_id <> target.file_id AND source.name = 'caller'",
+        ),
+        0
     );
 }
 

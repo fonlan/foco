@@ -283,6 +283,16 @@ pub fn index_workspace(workspace_path: impl AsRef<Path>) -> Result<IndexReport, 
     indexing::index_workspace(workspace_path.as_ref())
 }
 
+/// Incrementally refreshes explicitly changed workspace paths without walking
+/// the whole workspace. Callers must fall back to [`index_workspace`] when the
+/// changed path set is incomplete or cannot be classified safely.
+pub fn index_workspace_paths(
+    workspace_path: impl AsRef<Path>,
+    dirty_paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<IndexReport, CodeGraphError> {
+    indexing::index_workspace_paths(workspace_path.as_ref(), dirty_paths)
+}
+
 pub fn start_code_graph_watcher(
     workspace_path: impl AsRef<Path>,
 ) -> Result<CodeGraphWatcher, CodeGraphError> {
@@ -314,6 +324,8 @@ pub fn start_code_graph_watcher_with_debounce(
     let handle = thread::spawn(move || {
         let _watcher = watcher;
         let mut pending = false;
+        let mut pending_dirty_paths = HashSet::new();
+        let mut pending_requires_full_refresh = false;
         let mut next_index_at = Instant::now();
         let mut diagnostics = WatcherDiagnostics::new();
 
@@ -339,6 +351,8 @@ pub fn start_code_graph_watcher_with_debounce(
                     let should_index = batch.has_work();
                     diagnostics.record_batch(&batch);
                     if should_index {
+                        pending_dirty_paths.extend(batch.dirty_paths);
+                        pending_requires_full_refresh |= batch.fallback_reason.is_some();
                         if let Some(reason) = batch.fallback_reason {
                             tracing::warn!(
                                 workspace = %worker_workspace_path.display(),
@@ -360,12 +374,27 @@ pub fn start_code_graph_watcher_with_debounce(
                 let window = diagnostics.take_refresh_window();
                 #[cfg(test)]
                 worker_refresh_count.fetch_add(1, Ordering::Relaxed);
-                match index_workspace(&worker_workspace_path) {
+                let (index_scope, index_reason, result) = if pending_requires_full_refresh {
+                    pending_dirty_paths.clear();
+                    (
+                        "full_workspace",
+                        "watcher_safe_fallback",
+                        index_workspace(&worker_workspace_path),
+                    )
+                } else {
+                    let dirty_paths = std::mem::take(&mut pending_dirty_paths);
+                    (
+                        "dirty_paths",
+                        "watcher_debounced_relevant_event",
+                        index_workspace_paths(&worker_workspace_path, dirty_paths),
+                    )
+                };
+                match result {
                     Ok(report) => {
                         tracing::info!(
                             workspace = %worker_workspace_path.display(),
-                            index_scope = "full_workspace",
-                            index_reason = "watcher_debounced_relevant_event",
+                            index_scope,
+                            index_reason,
                             watch_event_queue = "bounded_coalescing",
                             watch_event_queue_capacity = WATCHER_COMMAND_QUEUE_CAPACITY,
                             watcher_event_batches = window.event_batches,
@@ -392,8 +421,8 @@ pub fn start_code_graph_watcher_with_debounce(
                     Err(error) => {
                         tracing::error!(
                             workspace = %worker_workspace_path.display(),
-                            index_scope = "full_workspace",
-                            index_reason = "watcher_debounced_relevant_event",
+                            index_scope,
+                            index_reason,
                             watch_event_queue = "bounded_coalescing",
                             watch_event_queue_capacity = WATCHER_COMMAND_QUEUE_CAPACITY,
                             watcher_event_batches = window.event_batches,
@@ -411,6 +440,7 @@ pub fn start_code_graph_watcher_with_debounce(
                     }
                 }
                 pending = false;
+                pending_requires_full_refresh = false;
             }
         }
 

@@ -8,10 +8,7 @@ use crate::memory_runtime::{
     memory_retrieval_query_text, neutral_messages_from_record,
     stored_turn_memory_messages_by_sequence,
 };
-use crate::runtime::{
-    open_workspace_database_ordinary_with_pre_stream_retry,
-    spawn_code_graph_workspace_initialization_if_needed,
-};
+use crate::runtime::open_workspace_database_ordinary_with_pre_stream_retry;
 use crate::*;
 use foco_store::config::PLAN_MODE_SYSTEM_PROMPT_NAME;
 use foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND;
@@ -87,9 +84,6 @@ pub(crate) async fn prepare_prompt_context_with_lifecycle(
         .iter()
         .find(|workspace| workspace.id == workspace_id)
         .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
-    if purpose.allows_code_graph_initialization() {
-        spawn_code_graph_workspace_initialization_if_needed(state, workspace);
-    }
     let (model, provider) = config
         .resolve_active_model_provider(model_id)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;

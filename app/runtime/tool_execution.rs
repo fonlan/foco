@@ -46,7 +46,8 @@ use super::{
     CodeGraphReadinessError, QuestionAnswer, QuestionItem, QuestionItemAnswer, QuestionOption,
     QuestionRegistry, QuestionRequest, ToolOutputDeltaSink, ToolResourceLease,
     ToolResourceLockOwner, ToolResourceLockRegistry, execute_image_tool, execute_web_tool,
-    image_tool_timeout_ms, is_image_tool_name, is_web_tool_name, wait_for_code_graph_ready,
+    image_tool_timeout_ms, is_image_tool_name, is_web_tool_name,
+    spawn_code_graph_execution_root_initialization_if_needed, wait_for_code_graph_ready,
     web_tool_timeout_ms,
 };
 use crate::*;
@@ -1386,6 +1387,14 @@ async fn execute_tool_unbudgeted(
         if is_code_graph_tool_name(&tool_name) {
             let indexes = code_graph_indexes.clone();
             let execution_root = builtin_workspace_path.to_path_buf();
+            // Graph startup is intentionally demand-driven: normal chat and
+            // Plan execution do not pay a full index cost unless a graph tool
+            // is actually invoked. The registry makes this single-flight.
+            spawn_code_graph_execution_root_initialization_if_needed(
+                indexes.clone(),
+                execution_root.clone(),
+                format!("graph-tool:{tool_name}"),
+            );
             let wait_cancellation = cancellation_token.clone();
             let wait_deadline = tool_deadline;
             let readiness = tokio::task::spawn_blocking(move || {

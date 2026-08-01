@@ -40,12 +40,11 @@ pub(crate) use broker_artifacts::BrokeredTransferFile;
 #[cfg(test)]
 pub(crate) use chat_run::agent_run_event_kind;
 pub(crate) use chat_run::run_chat_context_in_background;
+#[cfg(test)]
+pub(crate) use code_graph::release_code_graph_execution_root;
 pub(crate) use code_graph::{
-    CodeGraphIndexState, CodeGraphReadinessError, recently_active_code_graph_workspaces,
-    release_code_graph_execution_root, release_code_graph_then_delete_worktree,
-    spawn_code_graph_execution_root_initialization_if_needed,
-    spawn_code_graph_index_initialization, spawn_code_graph_workspace_initialization_if_needed,
-    wait_for_code_graph_ready,
+    CodeGraphIndexState, CodeGraphReadinessError, release_code_graph_then_delete_worktree,
+    spawn_code_graph_execution_root_initialization_if_needed, wait_for_code_graph_ready,
 };
 pub(crate) use foco_store::workspace::AGENT_MESSAGE_GUIDANCE_SOURCE;
 pub(crate) use image_tools::{
