@@ -98,6 +98,7 @@ const CHAT_TOP_LOAD_THRESHOLD_PX = 64;
 const UPWARD_HISTORY_INTENT_TTL_MS = 600;
 const MAX_GENERATED_IMAGE_PREVIEWS = 16;
 const TOOL_CALL_SCROLL_CLASS = "tool-call-scroll panel-scroll";
+const LIVE_REASONING_DURATION_REFRESH_MS = 1_000;
 
 const TOOL_CALL_ICONS: Record<string, LucideIcon> = {
   agent_cancel_task: Server,
@@ -2062,20 +2063,18 @@ function ReasoningBlock({
   durationMs,
   isStreaming,
   reasoning,
+  startedAtMs,
 }: {
   helpers: ChatPanelHelpers;
   durationMs: number | null;
   isStreaming: boolean;
   reasoning: string;
+  startedAtMs?: number;
 }) {
   const { compactInlineText, formatNullableLatencySeconds } = helpers;
-  const { language, t } = useI18n();
+  const { t } = useI18n();
   const [isExpanded, setIsExpanded] = useState(isStreaming);
   const preview = compactInlineText(reasoning);
-  const durationLabel = formatNullableLatencySeconds(durationMs, language);
-  const durationTitle = t("Thinking duration {duration}", {
-    duration: durationLabel,
-  });
 
   useEffect(() => {
     setIsExpanded(isStreaming);
@@ -2118,14 +2117,12 @@ function ReasoningBlock({
             {preview}
           </span>
         )}
-        {durationLabel && durationTitle ? (
-          <span
-            className="ml-auto shrink-0 tabular-nums text-[11px] font-semibold text-[var(--muted)]"
-            title={durationTitle}
-          >
-            {durationLabel}
-          </span>
-        ) : null}
+        <ReasoningDuration
+          durationMs={durationMs}
+          formatNullableLatencySeconds={formatNullableLatencySeconds}
+          isStreaming={isStreaming}
+          startedAtMs={startedAtMs}
+        />
       </Button>
       {isExpanded ? (
         <div className="mt-2 text-[var(--muted)]">
@@ -2140,6 +2137,81 @@ function ReasoningBlock({
       ) : null}
     </div>
   );
+}
+
+const ReasoningDuration = memo(function ReasoningDuration({
+  durationMs,
+  formatNullableLatencySeconds,
+  isStreaming,
+  startedAtMs,
+}: {
+  durationMs: number | null;
+  formatNullableLatencySeconds: ChatPanelHelpers["formatNullableLatencySeconds"];
+  isStreaming: boolean;
+  startedAtMs?: number;
+}) {
+  const { language, t } = useI18n();
+  const liveDurationMs = useLiveReasoningDuration(
+    isStreaming ? startedAtMs : undefined,
+  );
+  const durationLabel = formatNullableLatencySeconds(
+    durationMs ?? liveDurationMs,
+    language,
+  );
+  const durationTitle = t("Thinking duration {duration}", {
+    duration: durationLabel,
+  });
+
+  return durationLabel && durationTitle ? (
+    <span
+      className="ml-auto shrink-0 tabular-nums text-[11px] font-semibold text-[var(--muted)]"
+      title={durationTitle}
+    >
+      {durationLabel}
+    </span>
+  ) : null;
+});
+
+/**
+ * Keeps the streaming clock at the rendering leaf. The durable started time is
+ * supplied by the stream, so a hidden tab can stop ticking and recompute on
+ * visibility restoration without mutating the chat message array.
+ */
+function useLiveReasoningDuration(startedAtMs: number | undefined) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (startedAtMs === undefined || !Number.isFinite(startedAtMs)) {
+      return;
+    }
+    const refresh = () => setNowMs(Date.now());
+    const start = () => {
+      if (document.visibilityState === "visible") {
+        refresh();
+        return window.setInterval(refresh, LIVE_REASONING_DURATION_REFRESH_MS);
+      }
+      return null;
+    };
+    let intervalId = start();
+    const onVisibilityChange = () => {
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+        intervalId = null;
+      }
+      intervalId = start();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      if (intervalId !== null) {
+        window.clearInterval(intervalId);
+      }
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [startedAtMs]);
+
+  return startedAtMs === undefined || !Number.isFinite(startedAtMs)
+    ? null
+    : Math.max(0, nowMs - startedAtMs);
 }
 
 function AgentTaskLifecycleBlock({
@@ -2327,10 +2399,13 @@ function MessagePartBlockComponent({
       <ReasoningBlock
         helpers={helpers}
         durationMs={
-          part.liveDurationMs ?? part.durationMs ?? reasoningDurationFallbackMs
+          part.durationMs ??
+          (part.startedAtMs === undefined ? part.liveDurationMs : null) ??
+          reasoningDurationFallbackMs
         }
         isStreaming={isStreaming && isStreamingTail}
         reasoning={part.text}
+        startedAtMs={part.startedAtMs}
       />
     );
   }

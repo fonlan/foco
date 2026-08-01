@@ -198,24 +198,44 @@ export function useAiStatisticsData(
       return;
     }
 
-    const intervalId = window.setInterval(() => {
-      if (!autoRefreshEnabledRef.current || !isAiStatsDocumentVisible()) {
+    let disposed = false;
+    let timeoutId: number | null = null;
+    const schedule = () => {
+      if (
+        disposed ||
+        !autoRefreshEnabledRef.current ||
+        !isAiStatsDocumentVisible() ||
+        timeoutId !== null
+      ) {
         return;
       }
-      void loadStats(false, false, "auto");
-    }, AI_STATS_POLL_INTERVAL_MS);
+      timeoutId = window.setTimeout(async () => {
+        timeoutId = null;
+        await loadStats(false, false, "auto");
+        schedule();
+      }, AI_STATS_POLL_INTERVAL_MS);
+    };
     const handleVisibilityChange = () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
       if (!autoRefreshEnabledRef.current) {
         return;
       }
       if (isAiStatsDocumentVisible()) {
         void loadStats(statsRef.current === null, false, "auto");
+        schedule();
       }
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
+    schedule();
     return () => {
-      window.clearInterval(intervalId);
+      disposed = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
   }, [autoRefreshEnabled, loadStats]);
@@ -230,19 +250,38 @@ export function useAiStatisticsData(
       return;
     }
 
-    const intervalId = window.setInterval(() => {
-      const current = selectedRequestRef.current;
-      if (
-        !current ||
-        !autoRefreshEnabledRef.current ||
-        !isAiStatsDocumentVisible()
-      ) {
+    let disposed = false;
+    let timeoutId: number | null = null;
+    const schedule = () => {
+      if (disposed || !isAiStatsDocumentVisible() || timeoutId !== null) {
         return;
       }
-      void loadRequestDetail(current, false);
-    }, AI_REQUEST_DETAIL_POLL_INTERVAL_MS);
+      timeoutId = window.setTimeout(async () => {
+        timeoutId = null;
+        const current = selectedRequestRef.current;
+        if (current && autoRefreshEnabledRef.current) {
+          await loadRequestDetail(current, false);
+        }
+        schedule();
+      }, AI_REQUEST_DETAIL_POLL_INTERVAL_MS);
+    };
+    const handleVisibilityChange = () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      schedule();
+    };
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    schedule();
 
-    return () => window.clearInterval(intervalId);
+    return () => {
+      disposed = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, [autoRefreshEnabled, detail?.request.finalState, loadRequestDetail]);
 
   useEffect(() => {

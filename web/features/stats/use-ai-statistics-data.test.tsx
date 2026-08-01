@@ -131,11 +131,11 @@ describe("useAiStatisticsData", () => {
 
     unmount();
 
-    expect(clearTimeoutSpy).toHaveBeenCalledTimes(1);
+    expect(clearTimeoutSpy).toHaveBeenCalledTimes(2);
   });
 
   it("defaults to auto refresh and polls statistics every 5 seconds", async () => {
-    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     let hook: ReturnType<typeof useAiStatisticsData> | null = null;
     render(<HookProbe onHook={(value) => (hook = value)} />);
     await act(async () => undefined);
@@ -152,7 +152,7 @@ describe("useAiStatisticsData", () => {
   });
 
   it("stops list polling and visibility refresh while auto refresh is paused", async () => {
-    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     let hook: ReturnType<typeof useAiStatisticsData> | null = null;
     render(<HookProbe onHook={(value) => (hook = value)} />);
     await act(async () => undefined);
@@ -181,7 +181,7 @@ describe("useAiStatisticsData", () => {
   });
 
   it("reloads immediately and resumes polling after auto refresh starts again", async () => {
-    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     let hook: ReturnType<typeof useAiStatisticsData> | null = null;
     render(<HookProbe onHook={(value) => (hook = value)} />);
     await act(async () => undefined);

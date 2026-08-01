@@ -3415,12 +3415,9 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         );
     }
     project_remote_sidecar_terminal_agent_task_lifecycles(&reconciliation_state);
+    let reconciliation_wake = state.plan_phase_dispatch_registry.reconciliation_notifier();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        interval.tick().await;
         loop {
-            interval.tick().await;
             reconciliation_state
                 .plan_phase_dispatch_registry
                 .cancel_expired();
@@ -3458,6 +3455,11 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
                     error = %error,
                     "remote Plan wait resume worker exited unexpectedly"
                 ),
+            }
+            let delay = remote_sidecar_reconciliation_delay(&reconciliation_state);
+            tokio::select! {
+                _ = reconciliation_wake.notified() => {}
+                _ = tokio::time::sleep(delay) => {}
             }
         }
     });
@@ -4209,6 +4211,7 @@ fn remote_sidecar_deactivate_active_run(
 ) -> Option<RemoteActiveRunRegistration> {
     let registration = remote_sidecar_remove_active_run_stream(state, run_id);
     remote_sidecar_remove_active_run(state, run_id);
+    state.plan_phase_dispatch_registry.wake_reconciliation();
     registration
 }
 
@@ -4906,9 +4909,19 @@ fn remote_plan_queued_run_id_from_message(
     queued_run.get("runId")?.as_str().map(str::to_string)
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct RemotePlanPhaseDispatchRegistry {
     runs: Arc<Mutex<HashMap<String, RemotePlanPhaseDispatchRunControl>>>,
+    reconciliation_wake: Arc<tokio::sync::Notify>,
+}
+
+impl Default for RemotePlanPhaseDispatchRegistry {
+    fn default() -> Self {
+        Self {
+            runs: Arc::new(Mutex::new(HashMap::new())),
+            reconciliation_wake: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -4926,6 +4939,22 @@ struct RemotePlanPhaseDispatchLease {
 }
 
 impl RemotePlanPhaseDispatchRegistry {
+    fn reconciliation_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.reconciliation_wake.clone()
+    }
+
+    fn wake_reconciliation(&self) {
+        self.reconciliation_wake.notify_one();
+    }
+
+    fn next_deadline(&self) -> Option<DateTime<Utc>> {
+        let runs = self.runs.lock().ok()?;
+        runs.values()
+            .filter_map(|control| DateTime::parse_from_rfc3339(&control.deadline_at).ok())
+            .map(|deadline| deadline.with_timezone(&Utc))
+            .min()
+    }
+
     fn register(
         &self,
         attempt_id: String,
@@ -4961,6 +4990,8 @@ impl RemotePlanPhaseDispatchRegistry {
                 cancel_tx,
             },
         );
+        drop(runs);
+        self.wake_reconciliation();
         Ok(RemotePlanPhaseDispatchLease {
             registry: self.clone(),
             attempt_id,
@@ -4980,6 +5011,8 @@ impl RemotePlanPhaseDispatchRegistry {
         for control in runs.values().filter(|control| control.plan_id == plan_id) {
             let _ = control.cancel_tx.send(Some(reason.to_string()));
         }
+        drop(runs);
+        self.wake_reconciliation();
     }
 
     fn cancel_expired(&self) {
@@ -5033,6 +5066,7 @@ impl Drop for RemotePlanPhaseDispatchLease {
         if let Ok(mut runs) = self.registry.runs.lock() {
             runs.remove(&self.attempt_id);
         }
+        self.registry.wake_reconciliation();
     }
 }
 
@@ -20576,6 +20610,59 @@ async fn remote_sidecar_resume_satisfied_plan_waits(
         }
     }
     Ok(resumed)
+}
+
+/// The remote sidecar has no process-wide scheduler. Reconcile only when a
+/// durable wait deadline, an in-memory dispatch deadline, or a state transition
+/// requires it; an otherwise idle sidecar must not wake every few seconds.
+fn remote_sidecar_reconciliation_delay(state: &RemoteSidecarState) -> Duration {
+    const IDLE_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
+    const ERROR_RETRY_DELAY: Duration = Duration::from_secs(30);
+    const MIN_DEADLINE_DELAY: Duration = Duration::from_millis(25);
+
+    let durable_deadline = (|| -> Result<Option<DateTime<Utc>>, ApiError> {
+        let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        let Some(deadline) = database
+            .next_waiting_agent_task_dependency_deadline()
+            .map_err(ApiError::from_workspace_error)?
+        else {
+            return Ok(None);
+        };
+        DateTime::parse_from_rfc3339(&deadline)
+            .map(|deadline| Some(deadline.with_timezone(&Utc)))
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "remote Agent task dependency deadline is invalid: {error}"
+                ))
+            })
+    })();
+    let durable_deadline = match durable_deadline {
+        Ok(deadline) => deadline,
+        Err(error) => {
+            tracing::warn!(
+                workspace_id = %state.workspace_id,
+                error = %error.message,
+                "failed to discover remote Agent reconciliation deadline"
+            );
+            return ERROR_RETRY_DELAY;
+        }
+    };
+    let next_deadline = durable_deadline
+        .into_iter()
+        .chain(state.plan_phase_dispatch_registry.next_deadline())
+        .min();
+    let Some(deadline) = next_deadline else {
+        return IDLE_DELAY;
+    };
+    let millis = deadline
+        .signed_duration_since(Utc::now())
+        .num_milliseconds();
+    if millis <= 0 {
+        MIN_DEADLINE_DELAY
+    } else {
+        Duration::from_millis(millis as u64)
+    }
 }
 
 fn remote_sidecar_plan_worktree(

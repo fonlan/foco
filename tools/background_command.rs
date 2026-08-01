@@ -9,7 +9,7 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
     process::{ExitStatus, Stdio},
-    sync::{Arc, Mutex, MutexGuard, Weak},
+    sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
     thread::{self, JoinHandle},
     time::{Duration, Instant, SystemTime},
 };
@@ -33,6 +33,7 @@ const OUTPUT_READ_BUFFER_BYTES: usize = 8 * 1024;
 const MAX_OUTPUT_CHUNK_BYTES: usize = 4 * 1024;
 const MAX_OUTPUT_CHUNK_NEWLINES: usize = 1_999;
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MONITOR_MAX_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(500);
 #[cfg(windows)]
 const CREATE_NO_WINDOW: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(0x0800_0000);
@@ -259,6 +260,8 @@ struct BackgroundCommandEntry {
     started_monotonic: Instant,
     timeout: Option<Duration>,
     child: Mutex<Box<dyn ChildWrapper>>,
+    monitor_wake: Condvar,
+    monitor_wake_state: Mutex<bool>,
     state: Mutex<BackgroundCommandEntryState>,
     output_limit: usize,
 }
@@ -459,6 +462,8 @@ impl BackgroundCommandRegistry {
             started_monotonic: Instant::now(),
             timeout: request.timeout,
             child: Mutex::new(child),
+            monitor_wake: Condvar::new(),
+            monitor_wake_state: Mutex::new(false),
             state: Mutex::new(BackgroundCommandEntryState {
                 status: BackgroundCommandStatus::Running,
                 ended_at: None,
@@ -807,7 +812,9 @@ impl BackgroundCommandEntry {
         bytes: &[u8],
     ) -> Result<(), BackgroundCommandError> {
         let mut state = lock_recover(&self.state);
-        state.output.append(stream, bytes, self.output_limit)
+        state.output.append(stream, bytes, self.output_limit)?;
+        self.notify_monitor();
+        Ok(())
     }
 
     fn request_termination(&self, reason: BackgroundCommandTermination) -> bool {
@@ -821,6 +828,8 @@ impl BackgroundCommandEntry {
             graceful_signal_sent: false,
             force_kill_sent: false,
         });
+        drop(state);
+        self.notify_monitor();
         true
     }
 
@@ -876,6 +885,28 @@ impl BackgroundCommandEntry {
     fn force_terminate(&self) {
         let mut child = lock_recover(&self.child);
         let _ = child.start_kill();
+        self.notify_monitor();
+    }
+
+    fn notify_monitor(&self) {
+        let mut signalled = lock_recover(&self.monitor_wake_state);
+        *signalled = true;
+        self.monitor_wake.notify_one();
+    }
+
+    fn wait_for_monitor_signal(&self, wait: Duration) -> bool {
+        let mut signalled = lock_recover(&self.monitor_wake_state);
+        if *signalled {
+            *signalled = false;
+            return true;
+        }
+        let (mut signalled, _) = self
+            .monitor_wake
+            .wait_timeout(signalled, wait)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let was_signalled = *signalled;
+        *signalled = false;
+        was_signalled
     }
 
     fn finish(
@@ -1050,6 +1081,7 @@ fn monitor_background_command(
     stdout_reader: JoinHandle<Result<(), BackgroundCommandError>>,
     stderr_reader: JoinHandle<Result<(), BackgroundCommandError>>,
 ) {
+    let mut poll_interval = MONITOR_POLL_INTERVAL;
     let exit_status = loop {
         let now = Instant::now();
         entry.check_timeout(now);
@@ -1059,7 +1091,13 @@ fn monitor_background_command(
 
         match entry.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) => thread::sleep(MONITOR_POLL_INTERVAL),
+            Ok(None) => {
+                if entry.wait_for_monitor_signal(poll_interval) {
+                    poll_interval = MONITOR_POLL_INTERVAL;
+                } else {
+                    poll_interval = (poll_interval * 2).min(MONITOR_MAX_POLL_INTERVAL);
+                }
+            }
             Err(source) => {
                 entry.force_terminate();
                 entry.finish(

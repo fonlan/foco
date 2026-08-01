@@ -1308,7 +1308,6 @@ type WorkspaceFileContextMenuState = {
   workspacePath: string;
 };
 
-const LIVE_REASONING_DURATION_REFRESH_MS = 1000;
 const LIVE_CONTEXT_USAGE_REFRESH_MS = 5000;
 const AGENT_TEAM_UNSETTLED_REFRESH_MS = 1000;
 const UNSETTLED_AGENT_TASK_STATUSES = new Set([
@@ -5447,20 +5446,51 @@ export function App() {
       return;
     }
 
-    // ponytail: one interval owns Plan polling; split again only if these cadences diverge.
-    const intervalId = window.setInterval(() => {
-      if (!isDocumentVisible()) {
+    let disposed = false;
+    let requestInFlight = false;
+    let timeoutId: number | null = null;
+    const refresh = async () => {
+      if (disposed || requestInFlight || !isDocumentVisible()) {
         return;
       }
-      if (shouldRefreshAutoRunState) {
-        void loadPlanAutoRunState(activeWorkspace.id);
+      requestInFlight = true;
+      try {
+        await Promise.all([
+          shouldRefreshAutoRunState
+            ? loadPlanAutoRunState(activeWorkspace.id)
+            : undefined,
+          shouldRefreshRunningPlans
+            ? loadActivePlans(activeWorkspace.id)
+            : undefined,
+        ]);
+      } finally {
+        requestInFlight = false;
+        if (!disposed && isDocumentVisible()) {
+          timeoutId = window.setTimeout(refresh, PLAN_AUTO_RUN_REFRESH_MS);
+        }
       }
-      if (shouldRefreshRunningPlans) {
-        void loadActivePlans(activeWorkspace.id);
+    };
+    const onVisibilityChange = () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
       }
-    }, PLAN_AUTO_RUN_REFRESH_MS);
+      if (isDocumentVisible()) {
+        void refresh();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    if (isDocumentVisible()) {
+      timeoutId = window.setTimeout(refresh, PLAN_AUTO_RUN_REFRESH_MS);
+    }
 
-    return () => window.clearInterval(intervalId);
+    return () => {
+      disposed = true;
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, [
     activePlans,
     activeWorkspace?.id,
@@ -5484,30 +5514,57 @@ export function App() {
     const target = refreshTarget;
 
     let cancelled = false;
+    let requestInFlight = false;
+    let timeoutId: number | null = null;
     async function refreshRetryPhase() {
-      const plansResponse = await loadActivePlans(target.workspaceId);
-      if (cancelled || !plansResponse) {
+      if (cancelled || requestInFlight || !isDocumentVisible()) {
         return;
       }
-      if (!planPhaseRetryRefreshStillRunning(plansResponse.plans, target)) {
-        setPendingPlanPhaseRetryRefresh((current) =>
-          current && samePlanPhaseRetryRefreshTarget(current, target)
-            ? null
-            : current,
-        );
+      requestInFlight = true;
+      try {
+        const plansResponse = await loadActivePlans(target.workspaceId);
+        if (cancelled || !plansResponse) {
+          return;
+        }
+        if (!planPhaseRetryRefreshStillRunning(plansResponse.plans, target)) {
+          setPendingPlanPhaseRetryRefresh((current) =>
+            current && samePlanPhaseRetryRefreshTarget(current, target)
+              ? null
+              : current,
+          );
+        }
+      } finally {
+        requestInFlight = false;
       }
     }
 
-    const intervalId = window.setInterval(() => {
-      if (!isDocumentVisible()) {
-        return;
+    const schedule = () => {
+      if (!cancelled && isDocumentVisible() && timeoutId === null) {
+        timeoutId = window.setTimeout(async () => {
+          timeoutId = null;
+          await refreshRetryPhase();
+          schedule();
+        }, PLAN_PHASE_RETRY_REFRESH_INTERVAL_MS);
       }
-      void refreshRetryPhase();
-    }, PLAN_PHASE_RETRY_REFRESH_INTERVAL_MS);
+    };
+    const onVisibilityChange = () => {
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+        timeoutId = null;
+      }
+      if (isDocumentVisible()) {
+        void refreshRetryPhase().finally(schedule);
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    schedule();
 
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
+      }
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, [activeWorkspace?.id, loadActivePlans, pendingPlanPhaseRetryRefresh]);
 
@@ -11630,49 +11687,14 @@ export function App() {
     };
 
     let activeReasoningStartedAtMs: number | null = null;
-    let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null =
-      null;
     const streamAttemptSnapshots = new Map<string, StreamAttemptSnapshot>();
-    const updateLiveReasoningDuration = (startedAtMs: number) => {
-      if (!ownsSession()) {
-        return;
-      }
-      setMessagesForChatKey(chatKey, (current) =>
-        current.map((message) =>
-          isCurrentAssistantMessage(message) && message.status === "streaming"
-            ? {
-                ...message,
-                parts: updateActiveReasoningPartDuration(
-                  message.parts,
-                  startedAtMs,
-                  Date.now(),
-                ),
-              }
-            : message,
-        ),
-      );
-    };
     const startLiveReasoningDuration = () => {
       if (activeReasoningStartedAtMs !== null) {
         return activeReasoningStartedAtMs;
       }
       const startedAtMs = Date.now();
       activeReasoningStartedAtMs = startedAtMs;
-      if (liveReasoningDurationTimer !== null) {
-        clearInterval(liveReasoningDurationTimer);
-      }
-      updateLiveReasoningDuration(startedAtMs);
-      liveReasoningDurationTimer = setInterval(
-        () => updateLiveReasoningDuration(startedAtMs),
-        LIVE_REASONING_DURATION_REFRESH_MS,
-      );
       return startedAtMs;
-    };
-    const stopLiveReasoningDuration = () => {
-      if (liveReasoningDurationTimer !== null) {
-        clearInterval(liveReasoningDurationTimer);
-        liveReasoningDurationTimer = null;
-      }
     };
     const finishLiveReasoningDuration = (
       eventAssistantMessageId?: string,
@@ -11683,7 +11705,6 @@ export function App() {
         return;
       }
       activeReasoningStartedAtMs = null;
-      stopLiveReasoningDuration();
       const endedAtMs = Date.now();
       setMessagesForChatKey(chatKey, (current) =>
         current.map((message) => {
@@ -12186,7 +12207,6 @@ export function App() {
             const completedAtMs = Date.now();
             const completedReasoningStartedAtMs = activeReasoningStartedAtMs;
             activeReasoningStartedAtMs = null;
-            stopLiveReasoningDuration();
             const liveStatisticsUsage =
               streamEvent.usage &&
               streamEvent.usage.inputTokens !== null &&
@@ -12463,7 +12483,6 @@ export function App() {
 
           if (streamEvent.type === "streamEnd") {
             finishLiveReasoningDuration();
-            stopLiveReasoningDuration();
             finishStreamingAssistantMessage(currentAssistantMessageId);
             chatStreamHandoffsByChatKeyRef.current.set(chatKey, {
               chatId: activeRun.chatId,
@@ -12562,7 +12581,6 @@ export function App() {
       }
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
-      stopLiveReasoningDuration();
       const wasCancelled =
         requestError instanceof DOMException &&
         requestError.name === "AbortError";
@@ -12599,7 +12617,6 @@ export function App() {
       }
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
-      stopLiveReasoningDuration();
       if (!shouldReconnect) {
         refreshTerminalContextUsage();
       }
@@ -13064,49 +13081,14 @@ export function App() {
       liveStreamAssistantIdsByChatKeyRef.current.set(runMessagesKey, tracked);
     };
     let activeReasoningStartedAtMs: number | null = null;
-    let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null =
-      null;
     const streamAttemptSnapshots = new Map<string, StreamAttemptSnapshot>();
-    const updateLiveReasoningDuration = (startedAtMs: number) => {
-      if (!ownsSession()) {
-        return;
-      }
-      setMessagesForChatKey(runMessagesKey, (current) =>
-        current.map((message) =>
-          isCurrentAssistantMessage(message) && message.status === "streaming"
-            ? {
-                ...message,
-                parts: updateActiveReasoningPartDuration(
-                  message.parts,
-                  startedAtMs,
-                  Date.now(),
-                ),
-              }
-            : message,
-        ),
-      );
-    };
     const startLiveReasoningDuration = () => {
       if (activeReasoningStartedAtMs !== null) {
         return activeReasoningStartedAtMs;
       }
       const startedAtMs = Date.now();
       activeReasoningStartedAtMs = startedAtMs;
-      if (liveReasoningDurationTimer !== null) {
-        clearInterval(liveReasoningDurationTimer);
-      }
-      updateLiveReasoningDuration(startedAtMs);
-      liveReasoningDurationTimer = setInterval(
-        () => updateLiveReasoningDuration(startedAtMs),
-        LIVE_REASONING_DURATION_REFRESH_MS,
-      );
       return startedAtMs;
-    };
-    const stopLiveReasoningDuration = () => {
-      if (liveReasoningDurationTimer !== null) {
-        clearInterval(liveReasoningDurationTimer);
-        liveReasoningDurationTimer = null;
-      }
     };
     const finishLiveReasoningDuration = (
       eventAssistantMessageId?: string,
@@ -13117,7 +13099,6 @@ export function App() {
         return;
       }
       activeReasoningStartedAtMs = null;
-      stopLiveReasoningDuration();
       const endedAtMs = Date.now();
       setMessagesForChatKey(runMessagesKey, (current) =>
         current.map((message) => {
@@ -13599,7 +13580,6 @@ export function App() {
           const completedAtMs = Date.now();
           const completedReasoningStartedAtMs = activeReasoningStartedAtMs;
           activeReasoningStartedAtMs = null;
-          stopLiveReasoningDuration();
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
@@ -13879,7 +13859,6 @@ export function App() {
 
         if (streamEvent.type === "streamEnd") {
           finishLiveReasoningDuration();
-          stopLiveReasoningDuration();
           finishStreamingAssistantMessage(currentAssistantMessageId);
           if (requestChatId) {
             chatStreamHandoffsByChatKeyRef.current.set(currentRunningChatKey, {
@@ -13911,7 +13890,6 @@ export function App() {
 
         if (streamEvent.type === "error") {
           finishLiveReasoningDuration();
-          stopLiveReasoningDuration();
           streamHadError = true;
           setChatRunFailed(runMessagesKey, true);
           finishChatRun(
@@ -13981,7 +13959,6 @@ export function App() {
       }
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
-      stopLiveReasoningDuration();
       const wasCancelled =
         requestError instanceof DOMException &&
         requestError.name === "AbortError";
@@ -14012,7 +13989,6 @@ export function App() {
       }
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
-      stopLiveReasoningDuration();
       if (
         activeRunAbortByChatKeyRef.current.get(currentRunningChatKey) ===
         abortController
@@ -18630,29 +18606,6 @@ function appendReasoningPart(
     {
       ...lastPart,
       text: lastPart.text + text,
-    },
-  ];
-}
-
-function updateActiveReasoningPartDuration(
-  parts: ChatMessagePart[],
-  startedAtMs: number,
-  nowMs: number,
-): ChatMessagePart[] {
-  const lastPart = parts[parts.length - 1];
-  if (
-    lastPart?.type !== "reasoning" ||
-    lastPart.startedAtMs !== startedAtMs ||
-    lastPart.durationMs !== undefined
-  ) {
-    return parts;
-  }
-
-  return [
-    ...parts.slice(0, -1),
-    {
-      ...lastPart,
-      liveDurationMs: Math.max(0, nowMs - startedAtMs),
     },
   ];
 }

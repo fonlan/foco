@@ -54,6 +54,10 @@ const AGENT_SCHEDULER_WAKE_CAPACITY: usize = 1;
 const AGENT_SCHEDULER_SCAN_LIMIT: i64 = 64;
 const AGENT_SCHEDULER_MIN_DEADLINE_DELAY_MS: u64 = 1_000;
 const AGENT_SCHEDULER_ERROR_RETRY_SECS: i64 = 30;
+// Wake-driven scheduling owns ordinary queued/terminal transitions. A long
+// idle sleep keeps the scheduler parked when no durable wait deadline exists;
+// startup reconciliation handles attempts left behind by a prior runtime.
+const AGENT_SCHEDULER_IDLE_DELAY: Duration = Duration::from_secs(24 * 60 * 60);
 const AGENT_ATTEMPT_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_ATTEMPT_LEASE_HEARTBEAT: Duration = Duration::from_secs(5);
 const AGENT_GLOBAL_MAX_CONCURRENT_RUNS: usize = 10;
@@ -233,7 +237,7 @@ async fn run_agent_scheduler(
                     "Agent scheduler lease reconciliation failed"
                 );
             }
-            project_terminal_agent_task_lifecycles(&state);
+            let lifecycle_projection_failed = project_terminal_agent_task_lifecycles(&state);
             match schedule_runnable_tasks(
                 &state,
                 &permits,
@@ -243,7 +247,15 @@ async fn run_agent_scheduler(
             )
             .await
             {
-                Ok(result) => next_deadline_at = result.next_deadline_at,
+                Ok(mut result) => {
+                    if lifecycle_projection_failed {
+                        record_scheduler_retry_deadline(
+                            &mut result,
+                            AGENT_SCHEDULER_ERROR_RETRY_SECS,
+                        );
+                    }
+                    next_deadline_at = result.next_deadline_at;
+                }
                 Err(error) => {
                     next_deadline_at = Some(
                         Utc::now() + chrono::Duration::seconds(AGENT_SCHEDULER_ERROR_RETRY_SECS),
@@ -317,12 +329,14 @@ const AGENT_TASK_LIFECYCLE_PREVIEW_CHARS: usize = 1_024;
 
 /// Projects durable child-task terminal states into their root coordinator's
 /// visible assistant turn. Failure is intentionally isolated from task closure:
-/// a later scheduler scan retries the same deterministic event id.
-pub(crate) fn project_terminal_agent_task_lifecycles(state: &AppState) {
+/// the scheduler schedules a bounded retry for the same deterministic event id.
+/// Returns whether at least one workspace needs that compensation retry.
+pub(crate) fn project_terminal_agent_task_lifecycles(state: &AppState) -> bool {
     let Ok(config) = config_snapshot(state) else {
         tracing::error!("failed to load configuration for Agent lifecycle projection");
-        return;
+        return true;
     };
+    let mut failed = false;
     for workspace in config.local_workspaces() {
         let result = (|| -> Result<(), ApiError> {
             let mut database = open_workspace_database_critical(&workspace.path)?;
@@ -335,6 +349,7 @@ pub(crate) fn project_terminal_agent_task_lifecycles(state: &AppState) {
             Ok(())
         })();
         if let Err(error) = result {
+            failed = true;
             tracing::error!(
                 workspace_id = %workspace.id,
                 error = %error.message,
@@ -343,6 +358,7 @@ pub(crate) fn project_terminal_agent_task_lifecycles(state: &AppState) {
             );
         }
     }
+    failed
 }
 
 fn project_terminal_agent_task_lifecycle(
@@ -1286,6 +1302,13 @@ async fn schedule_runnable_tasks(
 ) -> Result<AgentSchedulerScan, ApiError> {
     let config = config_snapshot(state)?;
     let mut scan = AgentSchedulerScan::default();
+    // Deadline discovery cannot consume a coordinator permit. Otherwise a full
+    // global run pool would make an unrelated durable wait sleep until the
+    // long idle fallback, despite its deadline already being persisted.
+    for workspace in config.local_workspaces() {
+        let database = open_workspace_database_critical(&workspace.path)?;
+        record_next_agent_deadline(&mut scan, &database)?;
+    }
     'scan: for workspace in config.local_workspaces() {
         loop {
             let Ok(permit) = permits.clone().try_acquire_owned() else {
@@ -1435,6 +1458,14 @@ async fn schedule_runnable_tasks(
     Ok(scan)
 }
 
+fn record_scheduler_retry_deadline(scan: &mut AgentSchedulerScan, retry_after_secs: i64) {
+    let retry_at = Utc::now() + chrono::Duration::seconds(retry_after_secs);
+    match scan.next_deadline_at.as_ref() {
+        Some(current) if current <= &retry_at => {}
+        _ => scan.next_deadline_at = Some(retry_at),
+    }
+}
+
 async fn fail_claimed_task_after_scheduler_error(
     state: &AppState,
     identity: &AgentCoordinatorRunIdentity,
@@ -1496,10 +1527,7 @@ fn record_next_agent_deadline(
 
 fn agent_scheduler_deadline_delay(next_deadline_at: Option<&DateTime<Utc>>) -> Duration {
     let Some(next_deadline_at) = next_deadline_at else {
-        // Lease expiry is a durable recovery deadline even when no task
-        // dependency deadline exists. This re-check is what eventually closes
-        // a coordinator that was live during startup but later proved absent.
-        return AGENT_ATTEMPT_LEASE_TIMEOUT;
+        return AGENT_SCHEDULER_IDLE_DELAY;
     };
     let now = Utc::now();
     if next_deadline_at <= &now {
@@ -1511,7 +1539,7 @@ fn agent_scheduler_deadline_delay(next_deadline_at: Option<&DateTime<Utc>>) -> D
     if millis_until_deadline <= 0 {
         return Duration::from_millis(AGENT_SCHEDULER_MIN_DEADLINE_DELAY_MS);
     }
-    Duration::from_millis(millis_until_deadline as u64).min(AGENT_ATTEMPT_LEASE_TIMEOUT)
+    Duration::from_millis(millis_until_deadline as u64)
 }
 
 async fn run_coordinator_task(
@@ -4276,6 +4304,7 @@ mod tests {
     #[test]
     fn agent_scheduler_deadline_delay_has_idle_and_past_deadline_bounds() {
         let past = Utc::now() - chrono::Duration::seconds(1);
+        let future = Utc::now() + chrono::Duration::seconds(60);
 
         assert_eq!(
             agent_scheduler_deadline_delay(None),
@@ -4284,6 +4313,10 @@ mod tests {
         assert_eq!(
             agent_scheduler_deadline_delay(Some(&past)),
             Duration::from_millis(AGENT_SCHEDULER_MIN_DEADLINE_DELAY_MS)
+        );
+        assert!(
+            agent_scheduler_deadline_delay(Some(&future)) >= Duration::from_secs(59),
+            "a durable wait deadline must not be truncated to the attempt lease interval"
         );
     }
 
