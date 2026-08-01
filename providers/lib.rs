@@ -2167,10 +2167,14 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
     let client = config
         .genai_client()
         .map_err(|error| ProviderRequestFailure::new(error))?;
-    let chat_request = genai_chat_request_for_adapter(&request, config.kind.adapter_kind())
-        .map_err(|error| ProviderRequestFailure::new(error))?;
     let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)
         .map_err(|error| ProviderRequestFailure::new(error))?;
+    let chat_request = genai_chat_request_for_adapter_and_upstream_model(
+        &request,
+        config.kind.adapter_kind(),
+        upstream_model_id,
+    )
+    .map_err(|error| ProviderRequestFailure::new(error))?;
     let error_context = config
         .provider_error_context("opening provider stream", upstream_model_id)
         .map_err(|error| ProviderRequestFailure::new(error))?;
@@ -2295,10 +2299,14 @@ async fn stream_chat_with_capture_observer_websocket(
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
     ensure_proxy_compatible_with_kind(config.kind, config.proxy_url.is_some())
         .map_err(|error| ProviderRequestFailure::new(error))?;
-    let chat_request = genai_chat_request_for_adapter(&request, config.kind.adapter_kind())
-        .map_err(|error| ProviderRequestFailure::new(error))?;
     let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)
         .map_err(|error| ProviderRequestFailure::new(error))?;
+    let chat_request = genai_chat_request_for_adapter_and_upstream_model(
+        &request,
+        config.kind.adapter_kind(),
+        upstream_model_id,
+    )
+    .map_err(|error| ProviderRequestFailure::new(error))?;
     let error_context = config
         .provider_error_context("opening provider stream", upstream_model_id)
         .map_err(|error| ProviderRequestFailure::new(error))?;
@@ -2552,9 +2560,18 @@ fn genai_chat_request(request: &NeutralChatRequest) -> Result<ChatRequest, Provi
     genai_chat_request_for_adapter(request, AdapterKind::OpenAI)
 }
 
+#[cfg(test)]
 fn genai_chat_request_for_adapter(
     request: &NeutralChatRequest,
-    _adapter_kind: AdapterKind,
+    adapter_kind: AdapterKind,
+) -> Result<ChatRequest, ProviderConfigError> {
+    genai_chat_request_for_adapter_and_upstream_model(request, adapter_kind, &request.model_id)
+}
+
+fn genai_chat_request_for_adapter_and_upstream_model(
+    request: &NeutralChatRequest,
+    adapter_kind: AdapterKind,
+    upstream_model_id: &str,
 ) -> Result<ChatRequest, ProviderConfigError> {
     if request.model_id.trim().is_empty() {
         return Err(ProviderConfigError::InvalidRequest(
@@ -2574,10 +2591,15 @@ fn genai_chat_request_for_adapter(
         .take_while(|message| message.role == NeutralChatRole::System)
         .count();
     let leading_system = leading_system_prompt(&request.messages[..leading_system_count])?;
+    let requires_deepseek_tool_call_reasoning = adapter_kind == AdapterKind::DeepSeek
+        || model_rejects_native_tool_choice(upstream_model_id);
 
     let mut messages = Vec::with_capacity(request.messages.len() - leading_system_count);
     for message in &request.messages[leading_system_count..] {
-        messages.push(genai_message(message)?);
+        messages.push(genai_message(
+            message,
+            requires_deepseek_tool_call_reasoning,
+        )?);
     }
 
     let mut chat_request = ChatRequest::from_messages(messages);
@@ -2630,7 +2652,10 @@ fn validate_instruction_message(
     Ok(())
 }
 
-fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderConfigError> {
+fn genai_message(
+    message: &NeutralChatMessage,
+    requires_deepseek_tool_call_reasoning: bool,
+) -> Result<ChatMessage, ProviderConfigError> {
     match message.role {
         NeutralChatRole::System => {
             validate_instruction_message(message, "system")?;
@@ -2748,7 +2773,12 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
                 .iter()
                 .map(genai_tool_call)
                 .collect::<Vec<_>>();
-            if message.content.trim().is_empty() && reasoning.is_none() {
+            let missing_required_reasoning =
+                requires_deepseek_tool_call_reasoning && reasoning.is_none();
+            if message.content.trim().is_empty()
+                && reasoning.is_none()
+                && !missing_required_reasoning
+            {
                 return Ok(ChatMessage::from(tool_calls));
             }
 
@@ -2758,6 +2788,11 @@ fn genai_message(message: &NeutralChatMessage) -> Result<ChatMessage, ProviderCo
             }
             if let Some(reasoning) = reasoning {
                 parts.push(ContentPart::ReasoningContent(reasoning.to_string()));
+            } else if missing_required_reasoning {
+                // DeepSeek rejects a tool-result continuation when the preceding assistant
+                // tool-call message omits this field. Preserve the empty field for gateways
+                // that did not emit reasoning content rather than failing the next turn.
+                parts.push(ContentPart::ReasoningContent(String::new()));
             }
             if let Some(thought_signatures) = tool_calls
                 .first()
@@ -7304,15 +7339,19 @@ mod tests {
             content_base64: Some("cHJvbXB0".to_string()),
             path: None,
         });
-        let attachment_error = genai_message(&with_attachment).expect_err("developer attachment");
+        let attachment_error =
+            genai_message(&with_attachment, false).expect_err("developer attachment");
         assert!(
             attachment_error
                 .to_string()
                 .contains("developer messages cannot contain attachments")
         );
 
-        let empty_error = genai_message(&neutral_text_message(NeutralChatRole::Developer, "   "))
-            .expect_err("empty developer message");
+        let empty_error = genai_message(
+            &neutral_text_message(NeutralChatRole::Developer, "   "),
+            false,
+        )
+        .expect_err("empty developer message");
         assert!(
             empty_error
                 .to_string()
@@ -7322,7 +7361,8 @@ mod tests {
         let mut with_tool_state =
             neutral_text_message(NeutralChatRole::Developer, "Developer prompt.");
         with_tool_state.tool_call_id = Some("call-1".to_string());
-        let tool_state_error = genai_message(&with_tool_state).expect_err("developer tool state");
+        let tool_state_error =
+            genai_message(&with_tool_state, false).expect_err("developer tool state");
         assert!(
             tool_state_error
                 .to_string()
@@ -8438,6 +8478,145 @@ mod tests {
         assert_eq!(
             body_json["tools"][0]["function"]["name"],
             "select_relevant_memory"
+        );
+
+        while stream.next_event().await.is_some() {}
+        let _ = fixture.await;
+    }
+
+    #[tokio::test]
+    async fn opencode_go_deepseek_tool_call_without_reasoning_sends_empty_reasoning_content() {
+        let response = concat!(
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\\n\\n",
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\\n\\n",
+            "data: [DONE]\\n\\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENCODE_GO_KIND).expect("opencode-go kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::User, "inspect the workspace"),
+            NeutralChatMessage {
+                role: NeutralChatRole::Assistant,
+                content: String::new(),
+                attachments: Vec::new(),
+                reasoning: None,
+                tool_calls: vec![NeutralToolCall {
+                    call_id: "call-missing-reasoning".to_string(),
+                    name: "find_files".to_string(),
+                    arguments: serde_json::json!({"path": "."}),
+                    thought_signatures: None,
+                }],
+                tool_call_id: None,
+                tool_name: None,
+            },
+            NeutralChatMessage {
+                role: NeutralChatRole::Tool,
+                content: "{\"entries\":[]}".to_string(),
+                attachments: Vec::new(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-missing-reasoning".to_string()),
+                tool_name: Some("find_files".to_string()),
+            },
+        ]);
+        request.model_id = "deepseek-v4-flash".to_string();
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .as_http()
+            .expect("http request dump")
+            .clone();
+        let body = dump.body.as_deref().expect("request body");
+        let body_json: Value = serde_json::from_str(body).expect("request JSON");
+
+        assert_eq!(
+            body_json["messages"][1]["reasoning_content"],
+            serde_json::json!(""),
+            "DeepSeek rejects tool-result continuations when the assistant tool call omits reasoning_content"
+        );
+
+        while stream.next_event().await.is_some() {}
+        let _ = fixture.await;
+    }
+
+    #[tokio::test]
+    async fn opencode_go_redirected_deepseek_tool_call_without_reasoning_sends_empty_reasoning_content()
+     {
+        let response = concat!(
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\\n\\n",
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\\n\\n",
+            "data: [DONE]\\n\\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENCODE_GO_KIND).expect("opencode-go kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: vec![ProviderModelRedirect {
+                from: "deepseek-v4-flash".to_string(),
+                to: "alias-model".to_string(),
+            }],
+        };
+        let mut request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::User, "inspect the workspace"),
+            NeutralChatMessage {
+                role: NeutralChatRole::Assistant,
+                content: String::new(),
+                attachments: Vec::new(),
+                reasoning: None,
+                tool_calls: vec![NeutralToolCall {
+                    call_id: "call-missing-reasoning".to_string(),
+                    name: "find_files".to_string(),
+                    arguments: serde_json::json!({"path": "."}),
+                    thought_signatures: None,
+                }],
+                tool_call_id: None,
+                tool_name: None,
+            },
+            NeutralChatMessage {
+                role: NeutralChatRole::Tool,
+                content: "{\"entries\":[]}".to_string(),
+                attachments: Vec::new(),
+                reasoning: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call-missing-reasoning".to_string()),
+                tool_name: Some("find_files".to_string()),
+            },
+        ]);
+        request.model_id = "alias-model".to_string();
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .as_http()
+            .expect("http request dump")
+            .clone();
+        let body = dump.body.as_deref().expect("request body");
+        let body_json: Value = serde_json::from_str(body).expect("request JSON");
+
+        assert_eq!(body_json["model"], "deepseek-v4-flash");
+        assert_eq!(
+            body_json["messages"][1]["reasoning_content"],
+            serde_json::json!(""),
+            "DeepSeek redirects must preserve empty reasoning_content for assistant tool calls"
         );
 
         while stream.next_event().await.is_some() {}
