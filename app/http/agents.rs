@@ -379,9 +379,17 @@ pub(crate) async fn enable_agent_team(
         .map_err(ApiError::from_workspace_error)?
         .is_none()
     {
-        return Err(ApiError::bad_request(format!(
-            "chat was not found: {chat_id}"
-        )));
+        return Err(
+            crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                    "agent.team",
+                    "enable-team-chat-lookup",
+                    &workspace_id,
+                    database.database_path(),
+                )
+                .with_chat_id(chat_id.clone()),
+            ),
+        );
     }
     if database
         .agent_team_for_chat(&chat_id)

@@ -203,6 +203,22 @@ fn creates_workspace_foco_database_and_runs_migrations() {
 }
 
 #[test]
+fn set_chat_queued_run_returns_typed_missing_chat_error() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    let error = database
+        .set_chat_queued_run("missing-chat", "{}")
+        .expect_err("missing chat must not accept a queued run");
+
+    assert!(matches!(
+        error,
+        WorkspaceDatabaseError::ChatNotFound { chat_id } if chat_id == "missing-chat"
+    ));
+}
+
+#[test]
 fn concurrent_first_open_serializes_workspace_migrations() {
     const THREAD_COUNT: usize = 8;
 

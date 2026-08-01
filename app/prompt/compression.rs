@@ -3403,11 +3403,38 @@ pub(crate) fn persist_chat_result(
                     agent_task_id.as_str(),
                     &context.llm_request_id,
                 )
-                .map_err(ApiError::from_workspace_error)?;
+                .map_err(|error| {
+                    ApiError::from_workspace_error_with_chat_not_found_context(
+                        error,
+                        crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                            "chat.stream",
+                            "clear-agent-queued-run",
+                            &context.workspace_id,
+                            database.database_path(),
+                        )
+                        .with_chat_id(context.chat_id.clone())
+                        .with_queued_user_message_id(queued_user_message_id.clone())
+                        .with_run_id(context.llm_request_id.clone())
+                        .with_agent_task_id(agent_task_id.to_string()),
+                    )
+                })?;
         } else {
             database
                 .clear_chat_queued_run(&context.chat_id, queued_user_message_id)
-                .map_err(ApiError::from_workspace_error)?;
+                .map_err(|error| {
+                    ApiError::from_workspace_error_with_chat_not_found_context(
+                        error,
+                        crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                            "chat.stream",
+                            "clear-queued-run",
+                            &context.workspace_id,
+                            database.database_path(),
+                        )
+                        .with_chat_id(context.chat_id.clone())
+                        .with_queued_user_message_id(queued_user_message_id.clone())
+                        .with_run_id(context.llm_request_id.clone()),
+                    )
+                })?;
         }
     }
 

@@ -744,7 +744,20 @@ pub(crate) async fn edit_chat_user_message(
             invalidated_reason: "chat message edited",
             memory_invalidation_reason: "chat message edited",
         })
-        .map_err(ApiError::from_workspace_error)?;
+        .map_err(|error| {
+            ApiError::from_workspace_error_with_chat_not_found_context(
+                error,
+                crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                    "chat.edit",
+                    "rewrite-chat-from-user-message",
+                    &workspace_id,
+                    database.database_path(),
+                )
+                .with_chat_id(chat_id.clone())
+                .with_queued_user_message_id(message_id.clone())
+                .with_agent_task_id_opt(agent_task_id.as_ref().map(ToString::to_string)),
+            )
+        })?;
     if rewritten.agent_task_id.is_some() {
         state.agent_scheduler.wake()?;
     }
@@ -951,7 +964,17 @@ pub(crate) async fn queue_chat_message_internal(
         let chat = database
             .chat(&chat_id)
             .map_err(ApiError::from_workspace_error)?
-            .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+            .ok_or_else(|| {
+                crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                    crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                        "chat.queue",
+                        "durable-chat-lookup",
+                        &prompt_context.workspace_id,
+                        database.database_path(),
+                    )
+                    .with_chat_id(chat_id.clone()),
+                )
+            })?;
         (chat_id, chat.title, None)
     };
     if let (Some(team), Some(coordinator)) = (&team, &mut coordinator) {
@@ -1165,10 +1188,21 @@ pub(crate) async fn queue_chat_message_internal(
                 || delete_agent_worktree(&workspace.path, worktree_path, true),
             );
         }
-        return Err(ApiError::from_workspace_error(error));
+        return Err(ApiError::from_workspace_error_with_chat_not_found_context(
+            error,
+            crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                "chat.queue",
+                "queue-coordinator-transaction",
+                &prompt_context.workspace_id,
+                database.database_path(),
+            )
+            .with_chat_id(chat_id.clone())
+            .with_queued_user_message_id(user_message_id.clone())
+            .with_agent_task_id(task_id.clone()),
+        ));
     }
     let agent_team_id = Some(team_id);
-    let agent_task_id = Some(task_id);
+    let agent_task_id = Some(task_id.clone());
     if !defer_start {
         state.agent_scheduler.wake()?;
     }
@@ -1192,7 +1226,19 @@ pub(crate) async fn queue_chat_message_internal(
     let chat = database
         .chat(&chat_id)
         .map_err(ApiError::from_workspace_error)?
-        .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+        .ok_or_else(|| {
+            crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                    "chat.queue",
+                    "queue-result-readback",
+                    &prompt_context.workspace_id,
+                    database.database_path(),
+                )
+                .with_chat_id(chat_id.clone())
+                .with_queued_user_message_id(user_message_id.clone())
+                .with_agent_task_id(task_id.to_string()),
+            )
+        })?;
 
     Ok(QueuedChatMessageArtifacts {
         chat_id,
@@ -2601,7 +2647,17 @@ pub(crate) async fn chat_messages(
     let chat = database
         .chat(chat_id)
         .map_err(ApiError::from_workspace_error)?
-        .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+        .ok_or_else(|| {
+            crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                    "chat.messages",
+                    "read-chat",
+                    workspace_id,
+                    database.database_path(),
+                )
+                .with_chat_id(chat_id.to_string()),
+            )
+        })?;
     let chat_summary = chat_messages_chat_summary(&chat)?;
     let include_memory_dream_transcript_steps =
         chat_summary.kind.as_deref() == Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND);
@@ -2711,9 +2767,17 @@ pub(crate) async fn chat_todo_graph(
         .map_err(ApiError::from_workspace_error)?
         .is_none()
     {
-        return Err(ApiError::bad_request(format!(
-            "chat was not found: {chat_id}"
-        )));
+        return Err(
+            crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                    "chat.todo",
+                    "chat-existence-check",
+                    workspace_id,
+                    database.database_path(),
+                )
+                .with_chat_id(chat_id.to_string()),
+            ),
+        );
     }
 
     let status = optional_trimmed_string(query.status);
@@ -2747,9 +2811,17 @@ pub(crate) async fn chat_statistics(
         .map_err(ApiError::from_workspace_error)?
         .is_none()
     {
-        return Err(ApiError::bad_request(format!(
-            "chat was not found: {chat_id}"
-        )));
+        return Err(
+            crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                    "chat.statistics",
+                    "chat-existence-check",
+                    workspace_id,
+                    database.database_path(),
+                )
+                .with_chat_id(chat_id.to_string()),
+            ),
+        );
     }
 
     let message_counts = database
@@ -2859,9 +2931,17 @@ pub(crate) async fn delete_chat(
         .delete_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?
     {
-        return Err(ApiError::bad_request(format!(
-            "chat was not found: {chat_id}"
-        )));
+        return Err(
+            crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                    "chat.delete",
+                    "delete-durable-chat",
+                    workspace_id,
+                    database.database_path(),
+                )
+                .with_chat_id(chat_id.to_string()),
+            ),
+        );
     }
 
     workspace_response_from_config(

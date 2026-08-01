@@ -6733,11 +6733,11 @@ impl WorkspaceDatabase {
         chat_id: &str,
         queued_run_json: &str,
     ) -> Result<(), WorkspaceDatabaseError> {
-        let chat =
-            self.chat(chat_id)?
-                .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: format!("chat was not found: {chat_id}"),
-                })?;
+        let chat = self
+            .chat(chat_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::ChatNotFound {
+                chat_id: chat_id.to_string(),
+            })?;
         let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
         let queued_run = serde_json::from_str::<Value>(queued_run_json).map_err(|source| {
             WorkspaceDatabaseError::InvalidMessageMetadata {
@@ -7575,8 +7575,8 @@ impl WorkspaceDatabase {
             )?;
         }
         let chat = chat_from_transaction(&transaction, &database_path, queued.chat_id)?
-            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
-                message: format!("chat was not found: {}", queued.chat_id),
+            .ok_or_else(|| WorkspaceDatabaseError::ChatNotFound {
+                chat_id: queued.chat_id.to_string(),
             })?;
         let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
         chat_metadata.insert(QUEUED_CHAT_METADATA_KEY.to_string(), queued_run);
@@ -8379,8 +8379,8 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
         let chat =
             chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(|| {
-                WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: format!("chat was not found: {chat_id}"),
+                WorkspaceDatabaseError::ChatNotFound {
+                    chat_id: chat_id.to_string(),
                 }
             })?;
         let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
@@ -8527,8 +8527,8 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
         let chat =
             chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(|| {
-                WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: format!("chat was not found: {chat_id}"),
+                WorkspaceDatabaseError::ChatNotFound {
+                    chat_id: chat_id.to_string(),
                 }
             })?;
         let user = message_from_transaction(&transaction, &database_path, user_message_id)?
@@ -9885,8 +9885,8 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
         let chat =
             chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(|| {
-                WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: format!("chat was not found: {chat_id}"),
+                WorkspaceDatabaseError::ChatNotFound {
+                    chat_id: chat_id.to_string(),
                 }
             })?;
         let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
@@ -10357,8 +10357,8 @@ impl WorkspaceDatabase {
             )
             .optional()
             .map_err(|source| sqlite_error(&database_path, source))?
-            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
-                message: format!("chat was not found: {}", rewrite.chat_id),
+            .ok_or_else(|| WorkspaceDatabaseError::ChatNotFound {
+                chat_id: rewrite.chat_id.to_string(),
             })?;
         let chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
         if chat.archived_at.is_some() {
@@ -19386,8 +19386,8 @@ impl WorkspaceDatabase {
         tasks: Vec<TodoGraphTask>,
     ) -> Result<TodoGraphRecord, WorkspaceDatabaseError> {
         if self.chat(chat_id)?.is_none() {
-            return Err(WorkspaceDatabaseError::InvalidTodoGraph {
-                message: format!("chat was not found: {chat_id}"),
+            return Err(WorkspaceDatabaseError::ChatNotFound {
+                chat_id: chat_id.to_string(),
             });
         }
 
@@ -20854,6 +20854,9 @@ pub enum WorkspaceDatabaseError {
     InvalidMessageMetadata {
         message: String,
     },
+    ChatNotFound {
+        chat_id: String,
+    },
     ChatRewriteConflict {
         message: String,
     },
@@ -20977,6 +20980,7 @@ impl fmt::Display for WorkspaceDatabaseError {
             Self::InvalidMessageMetadata { message } => {
                 write!(formatter, "invalid message metadata: {message}")
             }
+            Self::ChatNotFound { chat_id } => write!(formatter, "chat was not found: {chat_id}"),
             Self::ChatRewriteConflict { message } => {
                 write!(formatter, "chat rewrite conflict: {message}")
             }
@@ -21090,6 +21094,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::InvalidAuditTokens { .. }
             | Self::InvalidCodeGraphInput { .. }
             | Self::InvalidMessageMetadata { .. }
+            | Self::ChatNotFound { .. }
             | Self::ChatRewriteConflict { .. }
             | Self::InvalidPlan { .. }
             | Self::PlanPhaseAttemptConflict { .. }

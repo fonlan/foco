@@ -115,7 +115,18 @@ pub(crate) async fn prepare_prompt_context_with_lifecycle(
             let chat = database
                 .chat(&chat_id)
                 .map_err(ApiError::from_workspace_error)?
-                .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+                .ok_or_else(|| {
+                    crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                        crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                            purpose.diagnostic_operation(),
+                            "existing-chat-lookup",
+                            workspace_id,
+                            database.database_path(),
+                        )
+                        .with_chat_id(chat_id.clone())
+                        .with_queued_user_message_id_opt(queued_user_message_id.clone()),
+                    )
+                })?;
             let metadata =
                 serde_json::from_str::<Value>(&chat.metadata_json).map_err(|source| {
                     ApiError::bad_request(format!("chat metadata was invalid: {source}"))

@@ -20,7 +20,7 @@ use crate::provider_agent_headers::{
 };
 use axum::{
     Json,
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response, sse::Event},
 };
 use base64::{Engine as _, engine::general_purpose};
@@ -175,6 +175,7 @@ pub(crate) use crate::runtime::{
 use crate::runtime::{ReadOnlyToolProgressDetector, RepeatedToolCallDetector};
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 
+mod chat_not_found_diagnostics;
 mod context_compression_policy;
 mod git_backend;
 mod hooks;
@@ -2567,6 +2568,13 @@ enum PromptAssemblyPurpose {
 }
 
 impl PromptAssemblyPurpose {
+    pub(crate) const fn diagnostic_operation(self) -> &'static str {
+        match self {
+            Self::ChatRun => "chat.prompt-assembly",
+            Self::ContextPreview => "context.usage",
+        }
+    }
+
     fn allows_llm_memory_retrieval(self) -> bool {
         matches!(self, Self::ChatRun)
     }
@@ -5955,7 +5963,20 @@ async fn prepare_chat_context_for_output(
                     &assistant_message_id,
                     assistant_sequence,
                 )
-                .map_err(ApiError::from_workspace_error)?;
+                .map_err(|error| {
+                    ApiError::from_workspace_error_with_chat_not_found_context(
+                        error,
+                        crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                            "chat.stream",
+                            "mark-queued-run-started",
+                            &prompt_context.workspace_id,
+                            database.database_path(),
+                        )
+                        .with_chat_id(chat_id.clone())
+                        .with_queued_user_message_id(user_message_id.clone())
+                        .with_run_id(llm_request_id.clone()),
+                    )
+                })?;
         }
     } else {
         database
@@ -8802,12 +8823,16 @@ pub(crate) fn plan_dispatch_owner_incarnation() -> Result<&'static str, ApiError
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<crate::chat_not_found_diagnostics::ChatNotFoundClientDiagnostic>,
 }
 
 #[derive(Debug)]
 pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
+    chat_not_found_diagnostic:
+        Option<crate::chat_not_found_diagnostics::ChatNotFoundClientDiagnostic>,
 }
 
 impl ApiError {
@@ -8815,6 +8840,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            chat_not_found_diagnostic: None,
         }
     }
 
@@ -8822,6 +8848,7 @@ impl ApiError {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
+            chat_not_found_diagnostic: None,
         }
     }
 
@@ -8829,6 +8856,7 @@ impl ApiError {
         Self {
             status: StatusCode::CONFLICT,
             message: message.into(),
+            chat_not_found_diagnostic: None,
         }
     }
 
@@ -8836,6 +8864,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_GATEWAY,
             message: message.into(),
+            chat_not_found_diagnostic: None,
         }
     }
 
@@ -8843,6 +8872,7 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            chat_not_found_diagnostic: None,
         }
     }
 
@@ -8850,6 +8880,7 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             message: message.into(),
+            chat_not_found_diagnostic: None,
         }
     }
 
@@ -8857,7 +8888,16 @@ impl ApiError {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
+            chat_not_found_diagnostic: None,
         }
+    }
+
+    pub(crate) fn with_chat_not_found_diagnostic(
+        mut self,
+        diagnostic: crate::chat_not_found_diagnostics::ChatNotFoundClientDiagnostic,
+    ) -> Self {
+        self.chat_not_found_diagnostic = Some(diagnostic);
+        self
     }
 
     pub(crate) fn message(&self) -> &str {
@@ -8889,6 +8929,7 @@ impl ApiError {
             | foco_store::workspace::WorkspaceDatabaseError::AgentRuntimeJson { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidAgentRuntimeData { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidMessageMetadata { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::ChatNotFound { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidPlan { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidScheduledTaskData { .. }
             | foco_store::workspace::WorkspaceDatabaseError::InvalidTodoGraph { .. }
@@ -8898,6 +8939,20 @@ impl ApiError {
                 Self::bad_request(error.to_string())
             }
             _ => Self::internal(error.to_string()),
+        }
+    }
+
+    pub(crate) fn from_workspace_error_with_chat_not_found_context(
+        error: foco_store::workspace::WorkspaceDatabaseError,
+        context: crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext,
+    ) -> Self {
+        match error {
+            foco_store::workspace::WorkspaceDatabaseError::ChatNotFound { chat_id } => {
+                crate::chat_not_found_diagnostics::api_error_for_missing_chat(
+                    context.with_chat_id(chat_id),
+                )
+            }
+            error => Self::from_workspace_error(error),
         }
     }
 
@@ -8926,13 +8981,29 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
+        let diagnostic_id = self
+            .chat_not_found_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.diagnostic_id.clone());
+        let mut response = (
             self.status,
             Json(ErrorResponse {
                 error: self.message,
+                diagnostic: self.chat_not_found_diagnostic,
             }),
         )
-            .into_response()
+            .into_response();
+        if let Some(diagnostic_id) = diagnostic_id
+            && let Ok(header_value) = HeaderValue::from_bytes(diagnostic_id.as_bytes())
+        {
+            response.headers_mut().insert(
+                header::HeaderName::from_static(
+                    crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_DIAGNOSTIC_HEADER,
+                ),
+                header_value,
+            );
+        }
+        response
     }
 }
 

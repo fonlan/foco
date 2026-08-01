@@ -1074,14 +1074,31 @@ async fn log_http_request(request: axum::extract::Request, next: middleware::Nex
     };
     tracing::info!(%method, %path, host = %host_for_log, "HTTP request started");
     let response = next.run(request).await;
-    tracing::info!(
-        %method,
-        %path,
-        host = %host_for_log,
-        status = response.status().as_u16(),
-        elapsed_ms = started_at.elapsed().as_millis() as u64,
-        "HTTP request completed"
-    );
+    let diagnostic_id = response
+        .headers()
+        .get(crate::chat_not_found_diagnostics::CHAT_NOT_FOUND_DIAGNOSTIC_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if let Some(diagnostic_id) = diagnostic_id {
+        tracing::warn!(
+            event = "chat_not_found_http_completed",
+            %diagnostic_id,
+            %method,
+            %path,
+            host = %host_for_log,
+            status = response.status().as_u16(),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "HTTP request completed with chat-not-found diagnostic"
+        );
+    } else {
+        tracing::info!(
+            %method,
+            %path,
+            host = %host_for_log,
+            status = response.status().as_u16(),
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            "HTTP request completed"
+        );
+    }
     response
 }
 

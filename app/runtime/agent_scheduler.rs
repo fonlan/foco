@@ -1782,7 +1782,21 @@ async fn run_coordinator_task_inner(
                 task.id.as_str(),
                 &chat_context.llm_request_id,
             )
-            .map_err(ApiError::from_workspace_error)?;
+            .map_err(|error| {
+                ApiError::from_workspace_error_with_chat_not_found_context(
+                    error,
+                    crate::chat_not_found_diagnostics::ChatNotFoundDiagnosticContext::local(
+                        "agent.scheduler",
+                        "queued-run-claim",
+                        &workspace.id,
+                        database.database_path(),
+                    )
+                    .with_chat_id(chat_context.chat_id.clone())
+                    .with_queued_user_message_id(queued_user_message_id.to_string())
+                    .with_run_id(chat_context.llm_request_id.clone())
+                    .with_agent_task_id(task.id.to_string()),
+                )
+            })?;
     }
     let next_run_event_sequence = database
         .next_run_event_sequence(task.id.as_str())
