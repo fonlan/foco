@@ -24,11 +24,11 @@ use crate::private_fs::{create_private_dir_all, prepare_private_file, restrict_s
 use memory_records::MemoryDatabaseKind;
 pub use memory_records::{
     MemoryDreamChangeRecord, MemoryDreamJobRecord, MemoryDreamJobTransitionOutcome,
-    MemoryEdgeRecord, MemoryExtractionJobRecord, MemoryFactRecord, MemoryProfileRecord,
-    MemoryReferenceRecord, MemorySourceRecord, NewMemoryDreamChange, NewMemoryDreamJob,
-    NewMemoryEdge, NewMemoryExtractionJob, NewMemoryFact, NewMemoryProfile, NewMemoryReference,
-    NewMemorySource, StartMemoryDreamJobOutcome, UpdateMemoryDreamChange, UpdateMemoryDreamJob,
-    UpdateMemoryFact, UpdateMemorySource,
+    MemoryEdgeRecord, MemoryExtractionJobRecord, MemoryFactCopyOutcome, MemoryFactRecord,
+    MemoryProfileRecord, MemoryReferenceRecord, MemorySourceRecord, NewMemoryDreamChange,
+    NewMemoryDreamJob, NewMemoryEdge, NewMemoryExtractionJob, NewMemoryFact, NewMemoryProfile,
+    NewMemoryReference, NewMemorySource, StartMemoryDreamJobOutcome, UpdateMemoryDreamChange,
+    UpdateMemoryDreamJob, UpdateMemoryFact, UpdateMemorySource,
 };
 use memory_schema::MemoryMigration;
 pub use memory_schema::{
@@ -3439,6 +3439,189 @@ impl MemoryDatabase {
             })
     }
 
+    /// Copy a source fact (and its sources) into `target` under
+    /// `target_fact_id`, skipping the write when the target already contains
+    /// that fact id. The target fact id must match the source kind and fact
+    /// text; anything else is an id collision and fails without touching the
+    /// source. This gives moves a retryable boundary across two SQLite files:
+    /// re-running the copy after a partial failure never creates a second
+    /// target copy.
+    pub fn copy_fact_to_database_idempotent(
+        &self,
+        target: &mut MemoryDatabase,
+        target_fact_id: &str,
+        target_scope: MemoryScope,
+        target_chat_id: Option<&str>,
+    ) -> Result<MemoryFactCopyOutcome, MemoryDatabaseError> {
+        require_non_empty("target_fact_id", target_fact_id)?;
+        let fact =
+            self.fact(target_fact_id)?
+                .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!("memory fact was not found: {target_fact_id}"),
+                })?;
+        let sources = self.sources_for_fact(target_fact_id)?;
+        target.write_fact_copy_idempotent(
+            target_fact_id,
+            target_scope,
+            target_chat_id,
+            &fact,
+            &sources,
+        )
+    }
+
+    /// Write a serialized fact (and its sources) into `target` under
+    /// `target_fact_id`, skipping the write when the target already contains
+    /// that fact id. The target fact id must match the source kind and fact
+    /// text; anything else is an id collision and fails without touching the
+    /// source. Used by the local move handler and by the remote sidecar, which
+    /// receives the fact payload from the main process instead of a second
+    /// SQLite handle; both paths share the same idempotency boundary.
+    pub fn write_fact_copy_idempotent(
+        &mut self,
+        target_fact_id: &str,
+        target_scope: MemoryScope,
+        target_chat_id: Option<&str>,
+        fact: &MemoryFactRecord,
+        sources: &[MemorySourceRecord],
+    ) -> Result<MemoryFactCopyOutcome, MemoryDatabaseError> {
+        require_non_empty("target_fact_id", target_fact_id)?;
+        self.validate_scope(target_scope)?;
+        let source_kind = memory_kind_from_str(&fact.kind)?;
+        ensure_memory_kind_scope_allowed(target_scope, source_kind)?;
+
+        if let Some(existing) = self.fact(target_fact_id)? {
+            let existing_kind = memory_kind_from_str(&existing.kind)?;
+            if existing_kind != source_kind || existing.fact != fact.fact {
+                return Err(MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!(
+                        "target memory fact id '{target_fact_id}' already exists with different content"
+                    ),
+                });
+            }
+            // A previous attempt may have written the fact but failed before
+            // preserving a disabled state; reconcile it so a retry ends in the
+            // same terminal state as a fresh move.
+            if existing.enabled != fact.enabled {
+                self.set_fact_enabled(target_fact_id, fact.enabled)?;
+            }
+            let target_fact = self.fact(target_fact_id)?.ok_or_else(|| {
+                MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!("copied memory fact was not found: {target_fact_id}"),
+                }
+            })?;
+            return Ok(MemoryFactCopyOutcome {
+                target_fact,
+                target_pre_existed: true,
+            });
+        }
+
+        for (index, source) in sources.iter().enumerate() {
+            let source_id = promoted_source_id(target_fact_id, index);
+            // Sources are written before the fact row, so a crash in between
+            // leaves orphaned source rows. Re-running the copy must not collide
+            // with those rows: matching rows are reused, mismatching rows are a
+            // real id collision and fail without touching the source.
+            if let Some(existing_source) = self.source(&source_id)? {
+                if !copied_source_matches(&existing_source, source) {
+                    return Err(MemoryDatabaseError::InvalidMemoryInput {
+                        message: format!(
+                            "target memory source id '{source_id}' already exists with different content"
+                        ),
+                    });
+                }
+                continue;
+            }
+            self.insert_source(NewMemorySource {
+                id: &source_id,
+                scope: target_scope,
+                chat_id: target_chat_id,
+                source_type: memory_source_type_from_str(&source.source_type)?,
+                source_id: source.source_id.as_deref(),
+                title: &source.title,
+                content: &source.content,
+                metadata_json: &source.metadata_json,
+            })?;
+        }
+
+        let copied_source_ids = promoted_source_ids(target_fact_id, sources.len());
+        let copied_source_refs = copied_source_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        self.insert_fact(NewMemoryFact {
+            id: target_fact_id,
+            scope: target_scope,
+            chat_id: target_chat_id,
+            status: memory_status_from_str(&fact.status)?,
+            kind: source_kind,
+            fact: &fact.fact,
+            confidence: fact.confidence,
+            pinned: fact.pinned,
+            source_ids: &copied_source_refs,
+            metadata_json: &fact.metadata_json,
+        })?;
+        if !fact.enabled {
+            self.set_fact_enabled(target_fact_id, false)?;
+        }
+
+        let target_fact =
+            self.fact(target_fact_id)?
+                .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!("copied memory fact was not found: {target_fact_id}"),
+                })?;
+        Ok(MemoryFactCopyOutcome {
+            target_fact,
+            target_pre_existed: false,
+        })
+    }
+
+    /// Finalize a move on the source side: mark the source fact superseded and
+    /// record where it moved. Idempotent: re-running after a partial failure
+    /// (or after a lost response) leaves the source in the same terminal state.
+    pub fn mark_fact_moved(
+        &mut self,
+        source_fact_id: &str,
+        moved_to_workspace_id: &str,
+        target_fact_id: &str,
+    ) -> Result<MemoryFactRecord, MemoryDatabaseError> {
+        require_non_empty("source_fact_id", source_fact_id)?;
+        require_non_empty("moved_to_workspace_id", moved_to_workspace_id)?;
+        require_non_empty("target_fact_id", target_fact_id)?;
+        let current =
+            self.fact(source_fact_id)?
+                .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                    message: format!("memory fact was not found: {source_fact_id}"),
+                })?;
+        let mut metadata = serde_json::from_str::<Value>(&current.metadata_json)
+            .unwrap_or_else(|_| Value::Object(Default::default()));
+        if let Some(object) = metadata.as_object_mut() {
+            object.insert(
+                "movedToWorkspace".to_string(),
+                Value::String(moved_to_workspace_id.to_string()),
+            );
+            object.insert(
+                "movedTargetFactId".to_string(),
+                Value::String(target_fact_id.to_string()),
+            );
+            object.insert("movedAt".to_string(), Value::String(now_timestamp()));
+        }
+        let metadata_json = serde_json::to_string(&metadata).map_err(|source| {
+            MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("failed to serialize moved memory metadata: {source}"),
+            }
+        })?;
+        self.update_fact(UpdateMemoryFact {
+            id: source_fact_id,
+            status: Some(MemoryStatus::Superseded),
+            metadata_json: Some(&metadata_json),
+            ..UpdateMemoryFact::default()
+        })?;
+        self.fact(source_fact_id)?
+            .ok_or_else(|| MemoryDatabaseError::InvalidMemoryInput {
+                message: format!("memory fact was not found after move: {source_fact_id}"),
+            })
+    }
+
     fn validate_scope(&self, scope: MemoryScope) -> Result<(), MemoryDatabaseError> {
         match (self.kind, scope) {
             (MemoryDatabaseKind::Global, MemoryScope::Global)
@@ -4975,6 +5158,17 @@ fn promoted_source_ids(promoted_fact_id: &str, count: usize) -> Vec<String> {
         .collect()
 }
 
+/// Whether an existing target source row can be reused by an idempotent copy
+/// retry. The copied source fields are deterministic from the source fact, so
+/// a matching row must have come from the same (partial) copy attempt.
+fn copied_source_matches(existing: &MemorySourceRecord, source: &MemorySourceRecord) -> bool {
+    existing.source_type == source.source_type
+        && existing.source_id == source.source_id
+        && existing.title == source.title
+        && existing.content == source.content
+        && existing.metadata_json == source.metadata_json
+}
+
 fn collect_rows<T>(
     rows: rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>>,
     database_path: &Path,
@@ -5303,6 +5497,652 @@ mod tests {
                 .fact("fact-project-promoted")
                 .expect("query")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn move_copy_is_idempotent_and_mark_fact_moved_supersedes_source() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut global =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        global
+            .insert_source(NewMemorySource {
+                id: "source-move",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Move source",
+                content: "Historical global project fact content",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        // Historical global project-class row (predates the kind/scope policy).
+        drop(global);
+        let connection = Connection::open(global_memory_database_path(profile.path()))
+            .expect("open global memory database");
+        connection
+            .execute_batch(
+                "INSERT INTO memory_facts
+                    (id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                     expires_at, metadata_json, created_at, updated_at)
+                 VALUES
+                    ('fact-move', 'global', NULL, 'active', 'project_fact',
+                     'Historical global project fact.', 0.8, 1, 1, NULL,
+                     '{\"origin\":\"legacy\"}',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                 INSERT INTO memory_fact_sources (fact_id, source_id)
+                 VALUES ('fact-move', 'source-move');",
+            )
+            .expect("insert historical global project fact");
+        drop(connection);
+
+        let workspace_dir = profile.path().join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "move target")
+                .expect("chat insert");
+        }
+        let mut global =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("reopen global memory");
+        let mut target = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("target workspace memory database");
+
+        let outcome = global
+            .copy_fact_to_database_idempotent(
+                &mut target,
+                "fact-move",
+                MemoryScope::Workspace,
+                None,
+            )
+            .expect("copy to workspace");
+        assert!(!outcome.target_pre_existed);
+        assert_eq!(outcome.target_fact.id, "fact-move");
+        assert_eq!(outcome.target_fact.scope, "workspace");
+        assert_eq!(outcome.target_fact.kind, "project_fact");
+        assert_eq!(outcome.target_fact.status, "active");
+        assert_eq!(outcome.target_fact.confidence, Some(0.8));
+        assert!(outcome.target_fact.pinned);
+        assert!(outcome.target_fact.enabled);
+        assert_eq!(
+            serde_json::from_str::<Value>(&outcome.target_fact.metadata_json)
+                .expect("metadata json")["origin"],
+            "legacy"
+        );
+        let target_sources = target
+            .sources_for_fact("fact-move")
+            .expect("target sources");
+        assert_eq!(target_sources.len(), 1);
+        assert_eq!(
+            target_sources[0].id, "fact-move:source:0",
+            "sources are copied with ids namespaced under the target fact"
+        );
+        assert_eq!(
+            target_sources[0].content,
+            "Historical global project fact content"
+        );
+
+        // Source is still active after the copy; only mark_fact_moved finalizes.
+        let source_before = global.fact("fact-move").expect("query").expect("source");
+        assert_eq!(source_before.status, "active");
+
+        // Idempotent retry never creates a second target copy.
+        let retry = global
+            .copy_fact_to_database_idempotent(
+                &mut target,
+                "fact-move",
+                MemoryScope::Workspace,
+                None,
+            )
+            .expect("idempotent copy retry");
+        assert!(retry.target_pre_existed);
+        assert_eq!(
+            target
+                .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 10, 0)
+                .expect("target active list")
+                .len(),
+            1
+        );
+
+        let moved = global
+            .mark_fact_moved("fact-move", "workspace-1", "fact-move")
+            .expect("mark moved");
+        assert_eq!(moved.status, "superseded");
+        let metadata: Value =
+            serde_json::from_str(&moved.metadata_json).expect("moved metadata json");
+        assert_eq!(metadata["movedToWorkspace"], "workspace-1");
+        assert_eq!(metadata["movedTargetFactId"], "fact-move");
+        assert!(metadata.get("movedAt").is_some());
+        assert_eq!(
+            metadata["origin"], "legacy",
+            "existing metadata is preserved"
+        );
+
+        // The source no longer appears as active global memory.
+        assert!(global.fact("fact-move").expect("query").is_some());
+        assert_eq!(
+            global
+                .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 10, 0)
+                .expect("global active list")
+                .len(),
+            0
+        );
+        // mark_fact_moved is itself idempotent.
+        let moved_again = global
+            .mark_fact_moved("fact-move", "workspace-1", "fact-move")
+            .expect("idempotent mark moved");
+        assert_eq!(moved_again.status, "superseded");
+    }
+
+    #[test]
+    fn copy_fact_to_database_idempotent_rejects_colliding_target() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace_dir = profile.path().join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "move collision")
+                .expect("chat insert");
+        }
+        let mut global =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        global
+            .insert_source(NewMemorySource {
+                id: "source-collision",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Collision source",
+                content: "Global preference",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        global
+            .insert_fact(NewMemoryFact {
+                id: "fact-collision",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::Preference,
+                fact: "Global preference",
+                confidence: None,
+                pinned: false,
+                source_ids: &["source-collision"],
+                metadata_json: "{}",
+            })
+            .expect("fact insert");
+        let mut target = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("target workspace memory database");
+        target
+            .insert_source(NewMemorySource {
+                id: "source-target-collision",
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Existing target source",
+                content: "Different target content",
+                metadata_json: "{}",
+            })
+            .expect("target source insert");
+        target
+            .insert_fact(NewMemoryFact {
+                id: "fact-collision",
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                status: MemoryStatus::Active,
+                kind: MemoryKind::Preference,
+                fact: "Different target content",
+                confidence: None,
+                pinned: false,
+                source_ids: &["source-target-collision"],
+                metadata_json: "{}",
+            })
+            .expect("target fact insert");
+
+        let error = global
+            .copy_fact_to_database_idempotent(
+                &mut target,
+                "fact-collision",
+                MemoryScope::Workspace,
+                None,
+            )
+            .expect_err("colliding target id must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("already exists with different content")
+        );
+        // Source stays untouched.
+        assert_eq!(
+            global
+                .fact("fact-collision")
+                .expect("query")
+                .expect("source")
+                .status,
+            "active"
+        );
+    }
+
+    #[test]
+    fn copy_target_write_failure_keeps_source_active() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut global =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        global
+            .insert_source(NewMemorySource {
+                id: "source-target-failure",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Source",
+                content: "Historical project fact",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        drop(global);
+        let connection = Connection::open(global_memory_database_path(profile.path()))
+            .expect("open global memory database");
+        connection
+            .execute_batch(
+                "INSERT INTO memory_facts
+                    (id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                     expires_at, metadata_json, created_at, updated_at)
+                 VALUES
+                    ('fact-target-failure', 'global', NULL, 'active', 'project_decision',
+                     'Historical global project decision.', NULL, 0, 1, NULL, '{}',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                 INSERT INTO memory_fact_sources (fact_id, source_id)
+                 VALUES ('fact-target-failure', 'source-target-failure');",
+            )
+            .expect("insert historical global project decision");
+        drop(connection);
+
+        let workspace_dir = profile.path().join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "move target failure")
+                .expect("chat insert");
+        }
+        let global =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("reopen global memory");
+        let mut target = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("target workspace memory database");
+        // A pre-existing source with the id the copy would use makes the target
+        // write fail before any fact row is inserted.
+        target
+            .insert_source(NewMemorySource {
+                id: "fact-target-failure:source:0",
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Occupied source id",
+                content: "Occupied",
+                metadata_json: "{}",
+            })
+            .expect("pre-insert colliding target source");
+
+        global
+            .copy_fact_to_database_idempotent(
+                &mut target,
+                "fact-target-failure",
+                MemoryScope::Workspace,
+                None,
+            )
+            .expect_err("target write must fail");
+
+        let source = global
+            .fact("fact-target-failure")
+            .expect("query")
+            .expect("source");
+        assert_eq!(
+            source.status, "active",
+            "failed target write must not touch source"
+        );
+        assert!(target.fact("fact-target-failure").expect("query").is_none());
+    }
+
+    #[test]
+    fn write_fact_copy_idempotent_payload_path_is_idempotent_and_rejects_collisions() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace_dir = profile.path().join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "move payload")
+                .expect("chat insert");
+        }
+        let mut target = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("target workspace memory database");
+
+        // Serialized payload as the sidecar receives it from the main process.
+        let fact = MemoryFactRecord {
+            id: "fact-payload".to_string(),
+            scope: "global".to_string(),
+            chat_id: None,
+            status: "active".to_string(),
+            kind: "project_fact".to_string(),
+            fact: "Historical global project fact (payload).".to_string(),
+            confidence: Some(0.7),
+            pinned: true,
+            enabled: false,
+            is_latest: true,
+            expires_at: None,
+            metadata_json: "{\"origin\":\"legacy\"}".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let sources = vec![MemorySourceRecord {
+            id: "source-payload".to_string(),
+            scope: "global".to_string(),
+            chat_id: None,
+            source_type: "manual_note".to_string(),
+            source_id: None,
+            title: "Payload source".to_string(),
+            content: "Historical source content".to_string(),
+            metadata_json: "{}".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+
+        let outcome = target
+            .write_fact_copy_idempotent(
+                "fact-payload",
+                MemoryScope::Workspace,
+                None,
+                &fact,
+                &sources,
+            )
+            .expect("payload write");
+        assert!(!outcome.target_pre_existed);
+        assert_eq!(outcome.target_fact.kind, "project_fact");
+        assert_eq!(outcome.target_fact.scope, "workspace");
+        assert_eq!(outcome.target_fact.status, "active");
+        assert_eq!(outcome.target_fact.confidence, Some(0.7));
+        assert!(outcome.target_fact.pinned);
+        assert!(!outcome.target_fact.enabled, "disabled flag is preserved");
+        assert_eq!(
+            serde_json::from_str::<Value>(&outcome.target_fact.metadata_json)
+                .expect("metadata json")["origin"],
+            "legacy"
+        );
+        assert_eq!(
+            target
+                .sources_for_fact("fact-payload")
+                .expect("target sources")[0]
+                .content,
+            "Historical source content"
+        );
+
+        // A retry after a lost response is idempotent and never duplicates.
+        let retry = target
+            .write_fact_copy_idempotent(
+                "fact-payload",
+                MemoryScope::Workspace,
+                None,
+                &fact,
+                &sources,
+            )
+            .expect("idempotent payload retry");
+        assert!(retry.target_pre_existed);
+        assert_eq!(
+            target
+                .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 10, 0)
+                .expect("target active list")
+                .len(),
+            1
+        );
+
+        // A colliding id with different content fails without overwriting.
+        let mut changed = fact.clone();
+        changed.fact = "Different payload content".to_string();
+        let error = target
+            .write_fact_copy_idempotent(
+                "fact-payload",
+                MemoryScope::Workspace,
+                None,
+                &changed,
+                &sources,
+            )
+            .expect_err("colliding payload must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("already exists with different content")
+        );
+        assert_eq!(
+            target
+                .fact("fact-payload")
+                .expect("query")
+                .expect("target fact")
+                .fact,
+            "Historical global project fact (payload)."
+        );
+    }
+
+    #[test]
+    fn write_fact_copy_idempotent_recovers_partially_written_sources() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace_dir = profile.path().join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "move partial recovery")
+                .expect("chat insert");
+        }
+        let mut target = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("target workspace memory database");
+        let fact = MemoryFactRecord {
+            id: "fact-partial".to_string(),
+            scope: "global".to_string(),
+            chat_id: None,
+            status: "active".to_string(),
+            kind: "project_fact".to_string(),
+            fact: "Partially copied project fact.".to_string(),
+            confidence: Some(0.6),
+            pinned: false,
+            enabled: false,
+            is_latest: true,
+            expires_at: None,
+            metadata_json: "{\"origin\":\"legacy\"}".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let sources = vec![MemorySourceRecord {
+            id: "source-partial".to_string(),
+            scope: "global".to_string(),
+            chat_id: None,
+            source_type: "manual_note".to_string(),
+            source_id: None,
+            title: "Partial source".to_string(),
+            content: "Partial source content".to_string(),
+            metadata_json: "{}".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }];
+        // Orphaned source rows from a failed first attempt that crashed after
+        // writing sources but before writing the fact row.
+        target
+            .insert_source(NewMemorySource {
+                id: "fact-partial:source:0",
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Partial source",
+                content: "Partial source content",
+                metadata_json: "{}",
+            })
+            .expect("orphan source insert");
+
+        let outcome = target
+            .write_fact_copy_idempotent(
+                "fact-partial",
+                MemoryScope::Workspace,
+                None,
+                &fact,
+                &sources,
+            )
+            .expect("recovered copy");
+        assert!(!outcome.target_pre_existed);
+        assert!(!outcome.target_fact.enabled, "disabled state is preserved");
+        assert_eq!(
+            target
+                .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 10, 0)
+                .expect("target active list")
+                .len(),
+            1
+        );
+        assert_eq!(
+            target
+                .sources_for_fact("fact-partial")
+                .expect("target sources")
+                .len(),
+            1,
+            "orphan source rows are reused, not duplicated"
+        );
+
+        // A mismatching orphan source is a real collision and still fails
+        // without overwriting the existing row.
+        let mut mismatched = fact.clone();
+        mismatched.id = "fact-partial-mismatch".to_string();
+        mismatched.fact = "Mismatched copy.".to_string();
+        target
+            .insert_source(NewMemorySource {
+                id: "fact-partial-mismatch:source:0",
+                scope: MemoryScope::Workspace,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Occupied",
+                content: "Different content",
+                metadata_json: "{}",
+            })
+            .expect("mismatch source insert");
+        let error = target
+            .write_fact_copy_idempotent(
+                "fact-partial-mismatch",
+                MemoryScope::Workspace,
+                None,
+                &mismatched,
+                &sources,
+            )
+            .expect_err("mismatched source id must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("already exists with different content")
+        );
+        assert!(
+            target
+                .fact("fact-partial-mismatch")
+                .expect("query")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mark_fact_moved_failure_after_target_copy_keeps_target_intact() {
+        let profile = tempfile::tempdir().expect("profile");
+        let mut global =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("global memory database");
+        global
+            .insert_source(NewMemorySource {
+                id: "source-cleanup-failure",
+                scope: MemoryScope::Global,
+                chat_id: None,
+                source_type: MemorySourceType::ManualNote,
+                source_id: None,
+                title: "Source",
+                content: "Historical global project fact",
+                metadata_json: "{}",
+            })
+            .expect("source insert");
+        drop(global);
+        let connection = Connection::open(global_memory_database_path(profile.path()))
+            .expect("open global memory database");
+        connection
+            .execute_batch(
+                "INSERT INTO memory_facts
+                    (id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                     expires_at, metadata_json, created_at, updated_at)
+                 VALUES
+                    ('fact-cleanup-failure', 'global', NULL, 'active', 'project_fact',
+                     'Historical global project fact.', 0.8, 1, 1, NULL, '{}',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                 INSERT INTO memory_fact_sources (fact_id, source_id)
+                 VALUES ('fact-cleanup-failure', 'source-cleanup-failure');",
+            )
+            .expect("insert historical global project fact");
+        drop(connection);
+
+        let workspace_dir = profile.path().join("workspace");
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        {
+            let mut workspace_database =
+                WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+            workspace_database
+                .insert_chat("chat-1", "move cleanup failure")
+                .expect("chat insert");
+        }
+        let mut global =
+            MemoryDatabase::open_or_create_global(profile.path()).expect("reopen global memory");
+        let mut target = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("target workspace memory database");
+
+        // Target write succeeds first (the safe order).
+        global
+            .copy_fact_to_database_idempotent(
+                &mut target,
+                "fact-cleanup-failure",
+                MemoryScope::Workspace,
+                None,
+            )
+            .expect("copy to workspace");
+
+        // Source cleanup fails: a concurrent forget hard-deletes the source
+        // between the copy and the mark. The error surfaces the partial state
+        // and the target copy remains fully intact.
+        global
+            .hard_delete_fact("fact-cleanup-failure")
+            .expect("concurrent forget");
+        let error = global
+            .mark_fact_moved(
+                "fact-cleanup-failure",
+                "workspace-1",
+                "fact-cleanup-failure",
+            )
+            .expect_err("missing source must fail the cleanup step");
+        assert!(error.to_string().contains("was not found"));
+
+        let target_fact = target
+            .fact("fact-cleanup-failure")
+            .expect("query")
+            .expect("target fact survives failed cleanup");
+        assert_eq!(target_fact.status, "active");
+        assert_eq!(target_fact.kind, "project_fact");
+        assert_eq!(
+            target
+                .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 10, 0)
+                .expect("target active list")
+                .len(),
+            1,
+            "no duplicate target copy"
         );
     }
 

@@ -16,6 +16,7 @@ import {
   EyeOff,
   FileText,
   Folder,
+  FolderInput,
   FolderSearch,
   Globe,
   GripVertical,
@@ -106,6 +107,7 @@ import type {
   MemorySourceFormState,
   MemorySourceRecord,
   MemorySourcesResponse,
+  MoveMemoryResponse,
   ModelFormState,
   ModelMetadataRecord,
   ModelMetadataResponse,
@@ -640,6 +642,10 @@ export function SettingsPanel({
   const [pendingMemoryEnabledIds, setPendingMemoryEnabledIds] = useState<Set<string>>(
     () => new Set(),
   );
+  const [memoryMoveTarget, setMemoryMoveTarget] = useState<MemoryFactRecord | null>(null);
+  const [memoryMoveWorkspaceId, setMemoryMoveWorkspaceId] = useState("");
+  const [isMovingMemory, setIsMovingMemory] = useState(false);
+  const [memoryMoveError, setMemoryMoveError] = useState<string | null>(null);
   const [memoryDreamRunKey, setMemoryDreamRunKey] = useState<string | null>(null);
   const [isClearingPassword, setIsClearingPassword] = useState(false);
   const [isSavingLanguage, setIsSavingLanguage] = useState(false);
@@ -3634,6 +3640,48 @@ export function SettingsPanel({
       setError(errorMessage(requestError));
     } finally {
       setIsSavingMemory(false);
+    }
+  }
+
+  function openMoveMemoryDialog(memory: MemoryFactRecord) {
+    setMemoryMoveTarget(memory);
+    setMemoryMoveWorkspaceId(workspaces[0]?.id ?? "");
+    setMemoryMoveError(null);
+  }
+
+  function closeMoveMemoryDialog() {
+    setMemoryMoveTarget(null);
+    setMemoryMoveWorkspaceId("");
+    setMemoryMoveError(null);
+  }
+
+  async function moveMemoryToWorkspace() {
+    if (!memoryMoveTarget) {
+      return;
+    }
+    const targetWorkspaceId = memoryMoveWorkspaceId.trim();
+    if (!targetWorkspaceId) {
+      setMemoryMoveError(t("Workspace is required"));
+      return;
+    }
+
+    setIsMovingMemory(true);
+    setMemoryMoveError(null);
+    try {
+      await requestJson<MoveMemoryResponse>("/api/memory/move", {
+        body: JSON.stringify({
+          memoryId: memoryMoveTarget.id,
+          targetWorkspaceId,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      closeMoveMemoryDialog();
+      await loadMemories();
+    } catch (requestError) {
+      setMemoryMoveError(errorMessage(requestError));
+    } finally {
+      setIsMovingMemory(false);
     }
   }
 
@@ -7772,6 +7820,73 @@ export function SettingsPanel({
                 </Modal.Backdrop>
               ) : null}
 
+              {memoryMoveTarget ? (
+                <Modal.Backdrop
+                  isDismissable
+                  isOpen
+                  onOpenChange={(open) => !open && closeMoveMemoryDialog()}
+                >
+                  <Modal.Container placement="center" size="sm">
+                    <Modal.Dialog aria-label={t("Move memory to workspace")}>
+                      <Modal.CloseTrigger aria-label={t("Close move memory dialog")} />
+                      <Modal.Header>
+                        <Modal.Heading>{t("Move memory to workspace")}</Modal.Heading>
+                      </Modal.Header>
+                      <Modal.Body className="space-y-3">
+                        <p className="text-sm text-[var(--muted)]">
+                          {t(
+                            "This memory will be moved to the selected workspace and removed from global memory.",
+                          )}
+                        </p>
+                        <div className="grid gap-1.5">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
+                            {t("Target workspace")}
+                          </span>
+                          <SettingsSelect
+                            aria-label={t("Target workspace")}
+                            onChange={(event) => setMemoryMoveWorkspaceId(event.target.value)}
+                            value={memoryMoveWorkspaceId}
+                          >
+                            {workspaces.map((workspace) => (
+                              <option key={workspace.id} value={workspace.id}>
+                                {workspace.name || workspace.id}
+                              </option>
+                            ))}
+                          </SettingsSelect>
+                        </div>
+                        {memoryMoveError ? (
+                          <p className="text-sm text-[var(--danger)]">{memoryMoveError}</p>
+                        ) : null}
+                      </Modal.Body>
+                      <Modal.Footer>
+                        <SettingsButton
+                          className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--foreground)] hover:bg-[var(--surface-secondary)] disabled:cursor-not-allowed disabled:opacity-60"
+                          disabled={isMovingMemory}
+                          onClick={closeMoveMemoryDialog}
+                          type="button"
+                        >
+                          {t("Cancel")}
+                        </SettingsButton>
+                        <SettingsButton
+                          aria-label={t("Move memory to workspace")}
+                          className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-3 text-sm font-semibold text-white hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                          disabled={isMovingMemory || !memoryMoveWorkspaceId.trim()}
+                          onClick={() => void moveMemoryToWorkspace()}
+                          type="button"
+                        >
+                          {isMovingMemory ? (
+                            <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                          ) : (
+                            <FolderInput aria-hidden="true" className="size-4" />
+                          )}
+                          {t("Move")}
+                        </SettingsButton>
+                      </Modal.Footer>
+                    </Modal.Dialog>
+                  </Modal.Container>
+                </Modal.Backdrop>
+              ) : null}
+
               <form
                 className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void saveMemorySettings(event)}
@@ -8946,6 +9061,17 @@ export function SettingsPanel({
                               type="button"
                             >
                               <ArrowUp aria-hidden="true" className="size-4" />
+                            </SettingsButton>
+                          ) : null}
+                          {memory.scope === "global" && isProjectMemoryKind(memory.kind) ? (
+                            <SettingsButton
+                              aria-label={t("Move to workspace")}
+                              className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
+                              onClick={() => openMoveMemoryDialog(memory)}
+                              title={t("Move to workspace")}
+                              type="button"
+                            >
+                              <FolderInput aria-hidden="true" className="size-4" />
                             </SettingsButton>
                           ) : null}
                           <SettingsButton

@@ -1338,6 +1338,13 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Promote one level": "提升一级",
     "Promote to workspace": "提升到工作区",
     "Promote to global": "提升到全局",
+    "Move to workspace": "移到工作区",
+    "Move memory to workspace": "将记忆移到工作区",
+    "Close move memory dialog": "关闭移到工作区弹窗",
+    "Target workspace": "目标工作区",
+    Move: "移动",
+    "This memory will be moved to the selected workspace and removed from global memory.":
+      "此记忆将移动到所选工作区，并从全局记忆中移除。",
     "Memory sources": "记忆来源",
     "No memory sources": "暂无记忆来源",
     "Edit memory": "编辑记忆",

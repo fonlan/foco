@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::memory::{
     MemoryDreamChangeStatus, MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope,
@@ -177,7 +177,7 @@ pub struct UpdateMemoryDreamChange<'a> {
     pub error_message: Option<&'a str>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemorySourceRecord {
     pub id: String,
     pub scope: String,
@@ -191,7 +191,7 @@ pub struct MemorySourceRecord {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MemoryFactRecord {
     pub id: String,
     pub scope: String,
@@ -207,6 +207,15 @@ pub struct MemoryFactRecord {
     pub metadata_json: String,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Result of an idempotent cross-database fact copy. `target_pre_existed`
+/// reports whether the target already contained the fact, so callers can
+/// distinguish a fresh write from a retry of a partially completed move.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MemoryFactCopyOutcome {
+    pub target_fact: MemoryFactRecord,
+    pub target_pre_existed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]

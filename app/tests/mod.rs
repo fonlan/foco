@@ -39348,6 +39348,329 @@ async fn memory_http_rejects_global_project_class_manual_and_promote() {
     app_task.abort();
 }
 
+/// Insert a historical global project-class memory row directly through SQL.
+/// The unified scope policy rejects creating project-class memories at global
+/// scope via `insert_fact`, so legacy rows (which predate the policy) are
+/// seeded the same way they exist in real installations.
+fn seed_historical_global_project_fact(
+    global_database_file: &Path,
+    fact_id: &str,
+    kind: &str,
+    fact: &str,
+    pinned: bool,
+) {
+    let connection = Connection::open(global_database_file).expect("open global memory database");
+    let source_id = format!("{fact_id}-source");
+    connection
+        .execute(
+            "INSERT INTO memory_sources
+                (id, scope, chat_id, source_type, source_id, title, content, metadata_json,
+                 created_at, updated_at)
+             VALUES (?1, 'global', NULL, 'manual_note', NULL, 'Legacy source', ?2, '{}',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            params![source_id, fact],
+        )
+        .expect("insert historical global project fact source");
+    connection
+        .execute(
+            "INSERT INTO memory_facts
+                (id, scope, chat_id, status, kind, fact, confidence, pinned, is_latest,
+                 expires_at, metadata_json, created_at, updated_at)
+             VALUES (?1, 'global', NULL, 'active', ?2, ?3, 0.8, ?4, 1, NULL,
+                     '{\"origin\":\"legacy\"}', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            params![fact_id, kind, fact, i64::from(pinned)],
+        )
+        .expect("insert historical global project fact row");
+    connection
+        .execute(
+            "INSERT INTO memory_fact_sources (fact_id, source_id) VALUES (?1, ?2)",
+            params![fact_id, source_id],
+        )
+        .expect("insert historical global project fact source link");
+    drop(connection);
+}
+
+#[tokio::test]
+async fn memory_move_local_success_preserves_fields_and_is_idempotent() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let global_memory_database_file = state.memory_database_file.clone();
+    {
+        let global = MemoryDatabase::open_or_create_global_at(&global_memory_database_file)
+            .expect("global memory database");
+        drop(global);
+    }
+    seed_historical_global_project_fact(
+        &global_memory_database_file,
+        "fact-move-http",
+        "project_fact",
+        "Historical global project fact.",
+        true,
+    );
+
+    let target_dir = profile.path().join("target-workspace");
+    fs::create_dir_all(&target_dir).expect("target workspace directory");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&target_dir).expect("target workspace database");
+        database
+            .insert_chat("chat-target", "Move target")
+            .expect("chat insert");
+    }
+    let other_dir = profile.path().join("other-workspace");
+    fs::create_dir_all(&other_dir).expect("other workspace directory");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&other_dir).expect("other workspace database");
+        database
+            .insert_chat("chat-other", "Other target")
+            .expect("chat insert");
+    }
+    {
+        let mut stored = state.config.lock().expect("config lock");
+        stored.workspaces.push(WorkspaceConfig {
+            id: "target-ws".to_string(),
+            name: "Target workspace".to_string(),
+            path: target_dir.clone(),
+            location: WorkspaceLocation::Local,
+            pinned: false,
+            terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
+        });
+        stored.workspaces.push(WorkspaceConfig {
+            id: "other-ws".to_string(),
+            name: "Other workspace".to_string(),
+            path: other_dir.clone(),
+            location: WorkspaceLocation::Local,
+            pinned: false,
+            terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
+        });
+    }
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind memory move server");
+    let app_addr = listener.local_addr().expect("memory move address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{app_addr}");
+
+    let move_request = || {
+        client.post(format!("{base}/api/memory/move")).json(&json!({
+            "memoryId": "fact-move-http",
+            "targetWorkspaceId": "target-ws"
+        }))
+    };
+
+    let moved = move_request().send().await.expect("move request");
+    assert_eq!(moved.status(), StatusCode::OK);
+    let moved_body: Value = moved.json().await.expect("move response");
+    assert_eq!(moved_body["status"], "moved");
+    assert_eq!(moved_body["targetWorkspaceId"], "target-ws");
+
+    {
+        let target_memory = MemoryDatabase::open_workspace_at(workspace_database_path(&target_dir))
+            .expect("reopen target memory database");
+        let fact = target_memory
+            .fact("fact-move-http")
+            .expect("target query")
+            .expect("target fact");
+        assert_eq!(fact.kind, "project_fact");
+        assert_eq!(fact.scope, "workspace");
+        assert_eq!(fact.status, "active");
+        assert_eq!(fact.fact, "Historical global project fact.");
+        assert_eq!(fact.confidence, Some(0.8));
+        assert!(fact.pinned);
+        assert!(fact.enabled);
+        assert_eq!(
+            serde_json::from_str::<Value>(&fact.metadata_json).expect("target metadata")["origin"],
+            "legacy"
+        );
+        let target_sources = target_memory
+            .sources_for_fact("fact-move-http")
+            .expect("target sources");
+        assert_eq!(target_sources.len(), 1);
+        assert_eq!(target_sources[0].id, "fact-move-http:source:0");
+        assert_eq!(target_sources[0].content, "Historical global project fact.");
+        assert_eq!(
+            target_memory
+                .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 10, 0)
+                .expect("target active list")
+                .len(),
+            1
+        );
+    }
+
+    // The source no longer appears as active global memory.
+    let global_list = client
+        .get(format!(
+            "{base}/api/memory?scope=global&status=active&page=1&pageSize=20"
+        ))
+        .send()
+        .await
+        .expect("global list after move")
+        .json::<Value>()
+        .await
+        .expect("global list response");
+    assert_eq!(global_list["totalCount"], 0);
+    let global_source = MemoryDatabase::open_or_create_global_at(&global_memory_database_file)
+        .expect("reopen global memory")
+        .fact("fact-move-http")
+        .expect("global query")
+        .expect("global source retained");
+    assert_eq!(global_source.status, "superseded");
+
+    // Retry after a lost response is idempotent: one target copy, same state.
+    let retry = move_request().send().await.expect("move retry");
+    assert_eq!(retry.status(), StatusCode::OK);
+    let target_memory = MemoryDatabase::open_workspace_at(workspace_database_path(&target_dir))
+        .expect("reopen target memory after retry");
+    assert_eq!(
+        target_memory
+            .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 10, 0)
+            .expect("target active list after retry")
+            .len(),
+        1
+    );
+
+    // Moving to a different workspace conflicts instead of duplicating.
+    let conflict = client
+        .post(format!("{base}/api/memory/move"))
+        .json(&json!({
+            "memoryId": "fact-move-http",
+            "targetWorkspaceId": "other-ws"
+        }))
+        .send()
+        .await
+        .expect("move elsewhere");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let other_memory = MemoryDatabase::open_workspace_at(workspace_database_path(&other_dir))
+        .expect("reopen other memory database");
+    assert!(
+        other_memory
+            .fact("fact-move-http")
+            .expect("query")
+            .is_none()
+    );
+
+    app_task.abort();
+}
+
+#[tokio::test]
+async fn memory_move_rejects_non_project_global_and_keeps_source_on_target_write_failure() {
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile.path().to_path_buf());
+    let global_memory_database_file = state.memory_database_file.clone();
+    {
+        let mut global = MemoryDatabase::open_or_create_global_at(&global_memory_database_file)
+            .expect("global memory database");
+        insert_test_memory_fact(
+            &mut global,
+            "source-pref-http",
+            "fact-pref-http",
+            MemoryScope::Global,
+            None,
+            "Global preference.",
+            false,
+        );
+        drop(global);
+    }
+    seed_historical_global_project_fact(
+        &global_memory_database_file,
+        "fact-move-fail-http",
+        "project_decision",
+        "Historical global project decision.",
+        false,
+    );
+    {
+        let mut workspace_database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        workspace_database
+            .insert_chat("chat-move-reject", "Memory move rejection")
+            .expect("chat insert");
+        drop(workspace_database);
+    }
+    // The target workspace already has a fact with the same id and different
+    // content, so the target write must fail without touching the source.
+    {
+        let mut workspace =
+            MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+                .expect("workspace memory database");
+        insert_test_memory_fact(
+            &mut workspace,
+            "source-collision-http",
+            "fact-move-fail-http",
+            MemoryScope::Workspace,
+            None,
+            "Different target content.",
+            false,
+        );
+    }
+
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind memory move rejection server");
+    let app_addr = listener
+        .local_addr()
+        .expect("memory move rejection address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+    let client = reqwest::Client::new();
+    let base = format!("http://{app_addr}");
+
+    // Non-project global memory cannot be moved.
+    let non_project = client
+        .post(format!("{base}/api/memory/move"))
+        .json(&json!({
+            "memoryId": "fact-pref-http",
+            "targetWorkspaceId": workspace_id
+        }))
+        .send()
+        .await
+        .expect("move global preference");
+    assert_eq!(non_project.status(), StatusCode::BAD_REQUEST);
+
+    // Target write failure keeps the global source active and untouched.
+    let failed = client
+        .post(format!("{base}/api/memory/move"))
+        .json(&json!({
+            "memoryId": "fact-move-fail-http",
+            "targetWorkspaceId": workspace_id
+        }))
+        .send()
+        .await
+        .expect("move with colliding target");
+    assert!(!failed.status().is_success());
+
+    let global = MemoryDatabase::open_or_create_global_at(&global_memory_database_file)
+        .expect("reopen global memory");
+    let source = global
+        .fact("fact-move-fail-http")
+        .expect("global query")
+        .expect("global source");
+    assert_eq!(source.status, "active");
+    let target = MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+        .expect("reopen target memory");
+    let collision = target
+        .fact("fact-move-fail-http")
+        .expect("target query")
+        .expect("pre-existing target row is untouched");
+    assert_eq!(collision.fact, "Different target content.");
+
+    app_task.abort();
+}
+
 pub(crate) fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) -> AppState {
     let (terminal_shutdown_tx, _) = broadcast::channel(1);
     let (app_shutdown_tx, app_shutdown_rx) = watch::channel(false);

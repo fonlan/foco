@@ -937,6 +937,14 @@ export const workspaceMemory = {
   scope: "workspace",
 };
 
+export const globalProjectMemory = {
+  ...activeMemory,
+  fact: "Legacy global project memory",
+  id: "memory-global-project-1",
+  kind: "project_fact",
+  scope: "global",
+};
+
 export const chatMemory = {
   ...activeMemory,
   chatId: "chat-test",
@@ -2368,6 +2376,7 @@ export const appTestState: {
   memoriesById: Record<string, MemoryFactRecord>;
   memoryListAdditional: MemoryFactRecord[];
   memoryEnabledResponses: Array<Response | Promise<Response>>;
+  memoryMoveResponses: Array<Response | Promise<Response>>;
   modelTestResponses: Array<Response | Promise<Response>>;
   updateHealthStatuses: number[];
   lastWorkspaceOrderRequest: string[] | null;
@@ -2424,9 +2433,11 @@ export const appTestState: {
     [chatMemory.id]: { ...chatMemory },
     [pendingMemory.id]: { ...pendingMemory },
     [workspaceMemory.id]: { ...workspaceMemory },
+    [globalProjectMemory.id]: { ...globalProjectMemory },
   },
   memoryListAdditional: [],
   memoryEnabledResponses: [],
+  memoryMoveResponses: [],
   modelTestResponses: [],
   updateHealthStatuses: [],
   lastWorkspaceOrderRequest: null,
@@ -2922,11 +2933,13 @@ export function resetAppTestEnvironment() {
   appTestState.workspaceChatsResponsesByWorkspaceId = {};
   appTestState.workspaceChatSearchResponseWorkspaces = null;
   appTestState.memoryDreamJobsResponses = [];
+  appTestState.memoryMoveResponses = [];
   appTestState.memoriesById = {
     [activeMemory.id]: { ...activeMemory },
     [chatMemory.id]: { ...chatMemory },
     [pendingMemory.id]: { ...pendingMemory },
     [workspaceMemory.id]: { ...workspaceMemory },
+    [globalProjectMemory.id]: { ...globalProjectMemory },
   };
   appTestState.memoryListAdditional = [];
   appTestState.memoryEnabledResponses = [];
@@ -4200,6 +4213,40 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     path === "/api/memory/promote"
   ) {
     return jsonResponse({ memory: activeMemory });
+  }
+
+  if (path === "/api/memory/move") {
+    const queuedResponse = appTestState.memoryMoveResponses.shift();
+    if (queuedResponse) {
+      return await queuedResponse;
+    }
+
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      memoryId?: string;
+      targetWorkspaceId?: string;
+    };
+    const memory = body.memoryId
+      ? appTestState.memoriesById[body.memoryId]
+      : undefined;
+    if (!memory || !body.targetWorkspaceId) {
+      return jsonResponse({ message: "memory fact was not found" }, { status: 404 });
+    }
+    // Simulate the durable move: the fact now belongs to the target workspace
+    // and no longer appears in the global list.
+    const movedMemory = {
+      ...memory,
+      chatId: null,
+      scope: "workspace",
+    };
+    delete appTestState.memoriesById[memory.id];
+    appTestState.memoryListAdditional = appTestState.memoryListAdditional.filter(
+      (item) => item.id !== memory.id,
+    );
+    return jsonResponse({
+      memory: movedMemory,
+      targetWorkspaceId: body.targetWorkspaceId,
+      status: "moved",
+    });
   }
 
   if (path === "/api/memory/dream/jobs") {

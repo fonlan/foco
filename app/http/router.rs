@@ -278,6 +278,7 @@ pub(crate) fn app_router(state: AppState) -> Router {
             "/api/memory/promote",
             post(crate::http::memory::promote_memory),
         )
+        .route("/api/memory/move", post(crate::http::memory::move_memory))
         .route(
             "/api/memory/sources",
             get(crate::http::memory::memory_sources),

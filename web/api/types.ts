@@ -1985,6 +1985,12 @@ export type MemoryMutationResponse = {
   memory: MemoryFactRecord | null;
 };
 
+export type MoveMemoryResponse = {
+  memory: MemoryFactRecord | null;
+  targetWorkspaceId: string;
+  status: string;
+};
+
 export type ClearMemoriesResponse = {
   deletedCount: number;
 };

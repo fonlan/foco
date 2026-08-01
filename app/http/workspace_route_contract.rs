@@ -1199,6 +1199,15 @@ pub(crate) const GLOBAL_WORKSPACE_ROUTE_CONTRACTS: &[GlobalWorkspaceRouteContrac
         "remote sidecar returns an explicit unsupported response until workspace/chat Memory promotion is implemented"
     ),
     global_workspace_route!(
+        "memory-move",
+        "/api/memory/move",
+        Post,
+        "memory/move",
+        JsonBody,
+        true,
+        "global Memory stays on the main process; the move handler drives a remote sidecar write through the internal memory/move-write endpoint"
+    ),
+    global_workspace_route!(
         "memory-extraction-retry",
         "/api/memory/extraction/retry",
         Post,

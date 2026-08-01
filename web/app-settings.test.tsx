@@ -20,6 +20,7 @@ import {
   enqueueChatStreamEvent,
   enqueueChatStreamEventForRun,
   failedMemoryDreamJob,
+  globalProjectMemory,
   jsonResponse,
   memoryDreamChange,
   memoryDreamJob,
@@ -3554,6 +3555,101 @@ describe("app-settings verification surfaces", () => {
 
     // Only the non-project workspace memory keeps its promote-to-global action.
     expect(screen.getAllByRole("button", { name: "Promote one level" })).toHaveLength(1);
+  });
+
+  it("moves historical global project memories to a selected workspace", async () => {
+    const fetchMock = vi.mocked(fetch);
+    appTestState.memoryListAdditional.push({ ...globalProjectMemory });
+    // The move dialog lists target workspaces from the settings response; add
+    // a second workspace so the user really chooses the destination.
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      workspaces: [
+        ...appTestState.settingsResponse.workspaces,
+        { ...secondaryWorkspace, isDefault: false },
+      ],
+    };
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    expect(await screen.findByText("Memory settings")).toBeInTheDocument();
+    expect(await screen.findByText(globalProjectMemory.fact)).toBeInTheDocument();
+
+    // Only historical global project memories offer the move action; the
+    // ordinary global preference does not.
+    const moveButtons = screen.getAllByRole("button", { name: "Move to workspace" });
+    expect(moveButtons).toHaveLength(1);
+
+    await userEvent.click(moveButtons[0]);
+    const dialog = await screen.findByRole("dialog", { name: "Move memory to workspace" });
+    expect(
+      within(dialog).getByText(
+        "This memory will be moved to the selected workspace and removed from global memory.",
+      ),
+    ).toBeInTheDocument();
+
+    // The user must explicitly pick a target workspace; there is no guessing.
+    await userEvent.selectOptions(
+      within(dialog).getByLabelText("Target workspace"),
+      secondaryWorkspace.id,
+    );
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Move memory to workspace" }),
+    );
+
+    await waitFor(() => {
+      const moveCall = fetchMock.mock.calls.find(([url]) => url === "/api/memory/move");
+      expect(moveCall).toBeDefined();
+      expect(JSON.parse(String(moveCall?.[1]?.body))).toEqual({
+        memoryId: globalProjectMemory.id,
+        targetWorkspaceId: secondaryWorkspace.id,
+      });
+    });
+
+    // Success closes the dialog and refreshes the global list without the
+    // moved fact.
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("dialog", { name: "Move memory to workspace" }),
+      ).not.toBeInTheDocument();
+      expect(screen.queryByText(globalProjectMemory.fact)).not.toBeInTheDocument();
+    });
+  });
+
+  it("keeps move errors visible and preserves the global fact", async () => {
+    appTestState.memoryMoveResponses.push(
+      jsonResponse({ message: "move failed" }, { status: 500 }),
+    );
+    appTestState.memoryListAdditional.push({ ...globalProjectMemory });
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    expect(await screen.findByText("Memory settings")).toBeInTheDocument();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Move to workspace" }),
+    );
+
+    const dialog = await screen.findByRole("dialog", { name: "Move memory to workspace" });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Move memory to workspace" }),
+    );
+
+    // The error stays in the dialog and the source fact remains listed.
+    expect(
+      await within(dialog).findByText("/api/memory/move returned 500"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: "Move memory to workspace" }),
+    ).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(await screen.findByText(globalProjectMemory.fact)).toBeInTheDocument();
   });
 
   it("deletes and approves memories", async () => {

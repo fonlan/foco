@@ -138,6 +138,25 @@ pub(crate) struct PromoteMemoryRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct MoveMemoryRequest {
+    memory_id: String,
+    target_workspace_id: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MoveMemoryResponse {
+    /// The moved fact as it now exists in the target workspace (local target)
+    /// or as reported by the sidecar (remote target).
+    memory: Option<MemoryFactRecord>,
+    target_workspace_id: String,
+    /// Always `moved` on success; retries of an already-moved fact return the
+    /// same terminal state instead of creating a second copy.
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct MemorySourcesQuery {
     scope: String,
     workspace_id: Option<String>,
@@ -1079,6 +1098,136 @@ pub(crate) async fn promote_memory(
     let memory = Some(memory);
 
     Ok(Json(MemoryMutationResponse { memory }))
+}
+
+/// Move a historical global project-class memory into a target workspace.
+///
+/// The source lives in the main-process global Memory SQLite; the target may be
+/// a local workspace or an SSH remote workspace. Cross-file writes cannot be
+/// atomic, so the sequence is intentionally retryable:
+///   1. write (or re-confirm) the fact in the target database;
+///   2. only after the target write succeeds, mark the global source superseded.
+/// A failure between the two steps reports `target written but source cleanup
+/// incomplete` so the caller knows a retry is safe and idempotent.
+pub(crate) async fn move_memory(
+    State(state): State<AppState>,
+    Json(request): Json<MoveMemoryRequest>,
+) -> Result<Json<MoveMemoryResponse>, ApiError> {
+    use foco_store::config::WorkspaceLocation;
+
+    let config = config_snapshot(&state)?;
+    let memory_id = normalized_required_text("memoryId", &request.memory_id)?;
+    let target_workspace_id =
+        normalized_required_text("targetWorkspaceId", &request.target_workspace_id)?;
+    let target_workspace = workspace_by_id(&config, &target_workspace_id)?;
+
+    let mut global_database = open_memory_database(&state, &config, MemoryScope::Global, None)?;
+    let source_fact = global_database
+        .fact(&memory_id)
+        .map_err(ApiError::from_memory_error)?
+        .ok_or_else(|| {
+            ApiError::from_status_message(
+                StatusCode::NOT_FOUND,
+                format!("memory fact was not found: {memory_id}"),
+            )
+        })?;
+    let source_kind = MemoryKind::parse(&source_fact.kind).map_err(ApiError::from_memory_error)?;
+    if !matches!(
+        source_kind,
+        MemoryKind::ProjectFact | MemoryKind::ProjectDecision
+    ) {
+        return Err(ApiError::bad_request(format!(
+            "only project_fact and project_decision memories can be moved to a workspace, got {}",
+            source_kind.as_str()
+        )));
+    }
+    if source_fact.scope != MemoryScope::Global.as_str() {
+        return Err(ApiError::bad_request(format!(
+            "only global memories can be moved to a workspace, got scope {}",
+            source_fact.scope
+        )));
+    }
+    // A retry of a completed move must not silently re-target a fact that
+    // already moved somewhere else.
+    if let Some(metadata) = serde_json::from_str::<Value>(&source_fact.metadata_json).ok() {
+        let already_moved_to = metadata
+            .get("movedToWorkspace")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|workspace_id| !workspace_id.is_empty());
+        if let Some(already_moved_to) = already_moved_to
+            && already_moved_to != target_workspace_id
+        {
+            return Err(ApiError::conflict(format!(
+                "memory fact {memory_id} was already moved to workspace {already_moved_to}"
+            )));
+        }
+    }
+
+    let moved_fact = match &target_workspace.location {
+        WorkspaceLocation::Local => {
+            let mut target_database = open_memory_database(
+                &state,
+                &config,
+                MemoryScope::Workspace,
+                Some(&target_workspace_id),
+            )?;
+            let outcome = global_database
+                .copy_fact_to_database_idempotent(
+                    &mut target_database,
+                    &memory_id,
+                    MemoryScope::Workspace,
+                    None,
+                )
+                .map_err(ApiError::from_memory_error)?;
+            apply_memory_expiration_to_fact(&mut target_database, &memory_id, &config.memory)?;
+            refresh_memory_profile(&mut target_database, MemoryScope::Workspace, None)?;
+            outcome.target_fact
+        }
+        WorkspaceLocation::Ssh { .. } => {
+            // The main process never opens the remote workspace database. The
+            // sidecar writes the fact into its own Memory SQLite and confirms
+            // before the global source is touched.
+            let sources = global_database
+                .sources_for_fact(&memory_id)
+                .map_err(ApiError::from_memory_error)?;
+            let payload = serde_json::json!({
+                "factId": memory_id,
+                "fact": source_fact,
+                "sources": sources,
+            });
+            let value = crate::remote_workspace::proxy_sidecar_json_request(
+                &state,
+                &target_workspace_id,
+                reqwest::Method::POST,
+                "memory/move-write",
+                Some(payload),
+            )
+            .await?;
+            serde_json::from_value(value.get("memory").cloned().unwrap_or(Value::Null)).map_err(
+                |source| {
+                    ApiError::bad_gateway(format!("invalid sidecar memory move response: {source}"))
+                },
+            )?
+        }
+    };
+
+    // Target write is durable; finalize the source. Any failure here is a
+    // retryable partial-move state, never a source data loss.
+    global_database
+        .mark_fact_moved(&memory_id, &target_workspace_id, &memory_id)
+        .map_err(|error| {
+            ApiError::internal(format!(
+                "memory move: target written but source cleanup incomplete: {error}"
+            ))
+        })?;
+    refresh_memory_profile(&mut global_database, MemoryScope::Global, None)?;
+
+    Ok(Json(MoveMemoryResponse {
+        memory: Some(moved_fact),
+        target_workspace_id: target_workspace_id.clone(),
+        status: "moved".to_string(),
+    }))
 }
 
 pub(crate) async fn memory_sources(

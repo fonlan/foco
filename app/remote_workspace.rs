@@ -52,7 +52,8 @@ use foco_store::{
     },
     memory::{
         MemoryDatabase, MemoryDreamChangeStatus, MemoryDreamJobStatus, MemoryDreamScope,
-        MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
+        MemoryFactRecord, MemoryKind, MemoryScope, MemorySourceRecord, MemorySourceType,
+        MemoryStatus, NewMemoryFact, NewMemorySource,
     },
     workspace::{
         AgentTaskStateUpdate, LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
@@ -3526,6 +3527,10 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         .route(
             "/api/remote/workspace/memory/manual",
             post(remote_sidecar_memory_manual),
+        )
+        .route(
+            "/api/remote/workspace/memory/move-write",
+            post(remote_sidecar_memory_move_write),
         )
         .route(
             "/api/remote/workspace/memory/{*path}",
@@ -22579,6 +22584,65 @@ async fn remote_sidecar_memory_manual(
         .fact(&memory_id)
         .map_err(|e| ApiError::from_memory_error(e).into_response())?;
     Ok(Json(json!({ "memory": memory })))
+}
+
+async fn remote_sidecar_memory_move_write(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    // Main-process move handler drives this endpoint after reading the global
+    // source. The sidecar writes the fact into its own workspace Memory SQLite
+    // with the same idempotency boundary as the local path; the main process
+    // only marks the global source superseded after this confirms.
+    let fact_id = payload
+        .get("factId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|fact_id| !fact_id.is_empty())
+        .ok_or_else(|| ApiError::bad_request("factId must not be empty").into_response())?;
+    let fact: MemoryFactRecord = serde_json::from_value(
+        payload.get("fact").cloned().unwrap_or(Value::Null),
+    )
+    .map_err(|error| {
+        ApiError::bad_request(format!("invalid memory move fact payload: {error}")).into_response()
+    })?;
+    if fact.id != fact_id {
+        return Err(
+            ApiError::bad_request("factId does not match the fact payload").into_response(),
+        );
+    }
+    let sources: Vec<MemorySourceRecord> = serde_json::from_value(
+        payload
+            .get("sources")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(vec![])),
+    )
+    .map_err(|error| {
+        ApiError::bad_request(format!("invalid memory move sources payload: {error}"))
+            .into_response()
+    })?;
+    // The move contract only ever transfers project-class memories; the main
+    // process already validated the source, this is defense-in-depth so the
+    // internal endpoint cannot be repurposed to seed arbitrary kinds.
+    let source_kind = MemoryKind::parse(&fact.kind).map_err(|error| {
+        ApiError::bad_request(format!("invalid memory move fact kind: {error}")).into_response()
+    })?;
+    if !matches!(
+        source_kind,
+        MemoryKind::ProjectFact | MemoryKind::ProjectDecision
+    ) {
+        return Err(ApiError::bad_request(
+            "only project_fact and project_decision memories can be moved to a workspace",
+        )
+        .into_response());
+    }
+
+    let mut database = foco_store::open_workspace_memory_database(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_memory_error(error).into_response())?;
+    let outcome = database
+        .write_fact_copy_idempotent(fact_id, MemoryScope::Workspace, None, &fact, &sources)
+        .map_err(|error| ApiError::from_memory_error(error).into_response())?;
+    Ok(Json(json!({ "memory": outcome.target_fact })))
 }
 
 async fn remote_sidecar_memory_get(
@@ -46083,6 +46147,151 @@ mod tests {
                 .path()
                 .join(".foco/remote-sidecar-global-memory-is-brokered.sqlite")
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_memory_move_write_is_idempotent_and_rejects_bad_payloads() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-move", "Remote move", "{}")
+            .expect("insert chat");
+        drop(database);
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let app = Router::new()
+            .route(
+                "/api/remote/workspace/memory/move-write",
+                post(remote_sidecar_memory_move_write),
+            )
+            .with_state(state.clone());
+
+        let fact_payload = || {
+            json!({
+                "factId": "fact-remote-move",
+                "fact": {
+                    "id": "fact-remote-move",
+                    "scope": "global",
+                    "chat_id": null,
+                    "status": "active",
+                    "kind": "project_fact",
+                    "fact": "Historical global project fact (remote).",
+                    "confidence": 0.7,
+                    "pinned": true,
+                    "enabled": false,
+                    "is_latest": true,
+                    "expires_at": null,
+                    "metadata_json": "{\"origin\":\"legacy\"}",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                },
+                "sources": [
+                    {
+                        "id": "source-remote-move",
+                        "scope": "global",
+                        "chat_id": null,
+                        "source_type": "manual_note",
+                        "source_id": null,
+                        "title": "Remote source",
+                        "content": "Historical source content",
+                        "metadata_json": "{}",
+                        "created_at": "2026-01-01T00:00:00Z",
+                        "updated_at": "2026-01-01T00:00:00Z"
+                    }
+                ]
+            })
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind move-write server");
+        let address = listener.local_addr().expect("move-write address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve move-write route");
+        });
+        let client = reqwest::Client::new();
+        let url = format!("http://{address}/api/remote/workspace/memory/move-write");
+
+        let response = client
+            .post(&url)
+            .json(&fact_payload())
+            .send()
+            .await
+            .expect("move-write request");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.expect("move-write response");
+        assert_eq!(body["memory"]["id"], "fact-remote-move");
+        assert_eq!(body["memory"]["scope"], "workspace");
+        assert_eq!(body["memory"]["kind"], "project_fact");
+        assert_eq!(body["memory"]["enabled"], false);
+
+        // Retry after a lost response is idempotent and never duplicates.
+        let retry = client
+            .post(&url)
+            .json(&fact_payload())
+            .send()
+            .await
+            .expect("move-write retry");
+        assert_eq!(retry.status(), StatusCode::OK);
+
+        // A mismatching factId is rejected before any write.
+        let mut mismatched = fact_payload();
+        mismatched["factId"] = json!("fact-other");
+        let mismatch = client
+            .post(&url)
+            .json(&mismatched)
+            .send()
+            .await
+            .expect("move-write mismatch");
+        assert_eq!(mismatch.status(), StatusCode::BAD_REQUEST);
+
+        // A payload that is not a project-class memory is rejected: the move
+        // contract only transfers project_fact/project_decision.
+        let mut non_project = fact_payload();
+        non_project["fact"]["kind"] = json!("preference");
+        let non_project_reject = client
+            .post(&url)
+            .json(&non_project)
+            .send()
+            .await
+            .expect("move-write non-project payload");
+        assert_eq!(non_project_reject.status(), StatusCode::BAD_REQUEST);
+
+        server.abort();
+
+        // The sidecar workspace has exactly one active copy with all fields.
+        let memory =
+            MemoryDatabase::open_or_create_workspace(workspace.path()).expect("workspace memory");
+        let fact = memory
+            .fact("fact-remote-move")
+            .expect("query")
+            .expect("moved fact");
+        assert_eq!(fact.scope, "workspace");
+        assert_eq!(fact.kind, "project_fact");
+        assert_eq!(fact.fact, "Historical global project fact (remote).");
+        assert_eq!(fact.confidence, Some(0.7));
+        assert!(fact.pinned);
+        assert!(!fact.enabled, "disabled state is preserved");
+        assert_eq!(
+            serde_json::from_str::<Value>(&fact.metadata_json).expect("metadata")["origin"],
+            "legacy"
+        );
+        let sources = memory
+            .sources_for_fact("fact-remote-move")
+            .expect("sources");
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, "fact-remote-move:source:0");
+        assert_eq!(sources[0].content, "Historical source content");
+        assert_eq!(
+            memory
+                .list_facts_for_scope_page(None, MemoryStatus::Active, None, None, 10, 0)
+                .expect("active list")
+                .len(),
+            1,
+            "retry never creates a second target copy"
         );
     }
 
