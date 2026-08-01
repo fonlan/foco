@@ -2302,6 +2302,7 @@ export function SettingsPanel({
   async function editConfiguredWorkspace(workspace: ConfiguredWorkspaceSummary) {
     setError(null);
     setWorkspaceForm({
+      codeGraphEnabled: workspace.codeGraphEnabled,
       commonCommands: workspace.commonCommands.map((command) => ({ ...command })),
       id: workspace.id,
       name: workspace.name,
@@ -3973,6 +3974,7 @@ export function SettingsPanel({
           serverId: isRemoteWorkspace ? workspaceForm.serverId : null,
           remotePath: isRemoteWorkspace ? remotePathValue : null,
           pinned: workspaceForm.pinned,
+          codeGraphEnabled: workspaceForm.codeGraphEnabled,
           terminalShell: workspaceForm.terminalShell,
           commonCommands: workspaceForm.commonCommands,
         }),
@@ -4103,6 +4105,7 @@ export function SettingsPanel({
           serverId: workspace.serverId ?? null,
           remotePath: workspace.remotePath ?? null,
           pinned,
+          codeGraphEnabled: workspace.codeGraphEnabled,
           terminalShell: workspace.terminalShell,
           commonCommands: workspace.commonCommands,
         }),
@@ -9594,6 +9597,39 @@ export function SettingsPanel({
                           type="checkbox"
                         />
                       </label>
+                      <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+                        <div className="flex items-center justify-between gap-3">
+                          <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-[var(--muted)]">
+                            <Code2
+                              aria-hidden="true"
+                              className="size-4 shrink-0 text-[var(--accent-soft-foreground)]"
+                            />
+                            <span className="truncate">
+                              {t("Enable Codegraph")}
+                            </span>
+                          </span>
+                          <SettingsInput
+                            aria-describedby="workspace-code-graph-description"
+                            aria-label={t("Enable Codegraph")}
+                            checked={workspaceForm.codeGraphEnabled}
+                            onChange={(event) =>
+                              setWorkspaceForm((current) => ({
+                                ...current,
+                                codeGraphEnabled: event.target.checked,
+                              }))
+                            }
+                            type="checkbox"
+                          />
+                        </div>
+                        <p
+                          className="mt-1 text-xs text-[var(--muted)]"
+                          id="workspace-code-graph-description"
+                        >
+                          {t(
+                            "Indexes code symbols and powers code graph tools in chats. When disabled, no index is built or maintained and chat does not receive code graph tools.",
+                          )}
+                        </p>
+                      </div>
                       <SettingsButton
                         aria-label={t("Save workspace")}
                         className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-sm font-semibold text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
@@ -14482,6 +14518,7 @@ function emptyManualMemoryForm(): ManualMemoryFormState {
 
 function emptyWorkspaceForm(): WorkspaceFormState {
   return {
+    codeGraphEnabled: false,
     commonCommands: [],
     id: "",
     name: "",

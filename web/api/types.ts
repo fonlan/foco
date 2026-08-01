@@ -1198,6 +1198,7 @@ export type WorkspaceSummary = {
   logoUrl: string | null;
   pinned: boolean;
   terminalShell: string;
+  codeGraphEnabled: boolean;
   commonCommands: WorkspaceCommonCommandSummary[];
   chats: ChatSummary[];
   chatPagination: WorkspaceChatPagination;
@@ -1233,6 +1234,7 @@ export type ConfiguredWorkspaceSummary = {
   logoUrl: string | null;
   pinned: boolean;
   terminalShell: string;
+  codeGraphEnabled: boolean;
   commonCommands: WorkspaceCommonCommandSummary[];
   isDefault: boolean;
 };
@@ -1247,6 +1249,7 @@ export type WorkspaceFormState = {
   specEnabled: boolean;
   specInjectEnabled: boolean;
   terminalShell: string;
+  codeGraphEnabled: boolean;
   commonCommands: WorkspaceCommonCommandSummary[];
 };
 

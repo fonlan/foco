@@ -939,6 +939,9 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Generate spec": "生成 Spec",
     "Reload spec": "重新加载 Spec",
     "Enable Project Spec": "启用项目 Spec",
+    "Enable Codegraph": "启用 Codegraph",
+    "Indexes code symbols and powers code graph tools in chats. When disabled, no index is built or maintained and chat does not receive code graph tools.":
+      "为代码符号建立索引，并让聊天获得代码图工具。关闭后不会建立或维护索引，聊天也不会获得代码图工具。",
     "Inject into new chats": "注入新会话",
     "No spec content": "暂无 Spec 内容",
     "Project Spec Markdown": "项目 Spec Markdown",

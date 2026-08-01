@@ -105,6 +105,7 @@ export const workspace = {
     total: workspaceChats.length,
   },
   chats: workspaceChats.slice(0, 5),
+  codeGraphEnabled: false,
   commonCommands: [],
   connectionStatus: "local",
   displayPath: "C:\\Users\\fonla\\.foco\\workspace",
@@ -128,6 +129,7 @@ export const secondaryWorkspace = {
     total: sideProjectChats.length,
   },
   chats: sideProjectChats,
+  codeGraphEnabled: false,
   commonCommands: [],
   connectionStatus: "local",
   displayPath: "C:\\Users\\fonla\\Documents\\Repos\\SideProject",
@@ -508,6 +510,7 @@ export const settings = {
       logoUrl: workspace.logoUrl,
       pinned: workspace.pinned,
       terminalShell: workspace.terminalShell,
+      codeGraphEnabled: workspace.codeGraphEnabled,
       commonCommands: workspace.commonCommands,
     },
   ],
@@ -2484,6 +2487,7 @@ function workspaceSettingsSummaryFromWorkspace(item: unknown): ConfiguredWorkspa
   const workspaceSummary = item as ConfiguredWorkspaceSummary & { chats?: unknown[] };
 
   return {
+    codeGraphEnabled: Boolean(workspaceSummary.codeGraphEnabled),
     commonCommands: workspaceSummary.commonCommands ?? [],
     connectionStatus: workspaceSummary.connectionStatus ?? "local",
     displayPath: workspaceSummary.displayPath ?? workspaceSummary.path,
@@ -3555,6 +3559,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       remotePath?: string | null;
       serverId?: string | null;
       terminalShell?: string | null;
+      codeGraphEnabled?: boolean;
     };
     const isRemote = Boolean(body.serverId?.trim());
     const remoteServer = isRemote
@@ -3578,6 +3583,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
       },
       chats: [],
       id: workspaceId,
+      codeGraphEnabled: Boolean(body.codeGraphEnabled),
       connectionStatus: isRemote ? "ready" : "local",
       displayPath,
       lastRemoteError: null,

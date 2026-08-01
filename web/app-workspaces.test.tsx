@@ -30,6 +30,7 @@ import {
 } from "./test-utils/app-test-harness";
 import { browserRouteFromPathname } from "./shared/browser-route";
 type WorkspaceFixture = {
+  codeGraphEnabled?: boolean;
   commonCommands: typeof workspace.commonCommands;
   connectionStatus?: string;
   displayPath?: string;
@@ -47,6 +48,7 @@ type WorkspaceFixture = {
 
 function configuredWorkspace(item: WorkspaceFixture, isDefault = false) {
   return {
+    codeGraphEnabled: item.codeGraphEnabled ?? false,
     commonCommands: item.commonCommands,
     connectionStatus: item.connectionStatus,
     displayPath: item.displayPath,
@@ -1393,6 +1395,85 @@ describe("app-workspaces verification surfaces", () => {
     expect(await screen.findByRole("button", { name: "Edit workspace New Workspace" })).toBeInTheDocument();
   });
 
+  it("defaults the Codegraph switch off when adding a workspace and submits codeGraphEnabled false", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Add workspace" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Add workspace" });
+    const codeGraphSwitch = within(dialog).getByRole("switch", {
+      name: "Enable Codegraph",
+    });
+    expect(codeGraphSwitch).not.toBeChecked();
+    expect(
+      within(dialog).getByText(
+        "Indexes code symbols and powers code graph tools in chats. When disabled, no index is built or maintained and chat does not receive code graph tools.",
+      ),
+    ).toBeInTheDocument();
+
+    await userEvent.type(
+      within(dialog).getByPlaceholderText("Workspace name"),
+      "New Workspace",
+    );
+    await userEvent.type(
+      within(dialog).getByPlaceholderText("C:/Users/name/workspace"),
+      "C:/Users/fonla/Documents/Repos/NewWorkspace",
+    );
+    await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
+
+    await waitFor(() => {
+      const addWorkspaceCall = fetchMock.mock.calls.find(
+        ([url, init]) => url === "/api/workspaces/add" && init?.method === "POST",
+      );
+      expect(addWorkspaceCall).toBeDefined();
+      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual(
+        expect.objectContaining({
+          codeGraphEnabled: false,
+          name: "New Workspace",
+        }),
+      );
+    });
+  });
+
+  it("submits codeGraphEnabled true when the Codegraph switch is enabled for a new workspace", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Add workspace" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Add workspace" });
+    const codeGraphSwitch = within(dialog).getByRole("switch", {
+      name: "Enable Codegraph",
+    });
+    expect(codeGraphSwitch).not.toBeChecked();
+    await userEvent.click(codeGraphSwitch);
+    expect(codeGraphSwitch).toBeChecked();
+
+    await userEvent.type(
+      within(dialog).getByPlaceholderText("Workspace name"),
+      "New Workspace",
+    );
+    await userEvent.type(
+      within(dialog).getByPlaceholderText("C:/Users/name/workspace"),
+      "C:/Users/fonla/Documents/Repos/NewWorkspace",
+    );
+    await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
+
+    await waitFor(() => {
+      const addWorkspaceCall = fetchMock.mock.calls.find(
+        ([url, init]) => url === "/api/workspaces/add" && init?.method === "POST",
+      );
+      expect(addWorkspaceCall).toBeDefined();
+      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual(
+        expect.objectContaining({
+          codeGraphEnabled: true,
+          name: "New Workspace",
+        }),
+      );
+    });
+  });
+
   it("uploads and clears a workspace icon in workspace settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
@@ -1446,7 +1527,7 @@ describe("app-workspaces verification surfaces", () => {
       await screen.findByRole("button", { name: "Edit workspace Default" }),
     );
 
-    const specCheckbox = await screen.findByRole("checkbox", {
+    const specCheckbox = await screen.findByRole("switch", {
       name: "Enable Project Spec",
     });
     await waitFor(() => expect(specCheckbox).toBeEnabled());
@@ -1479,7 +1560,7 @@ describe("app-workspaces verification surfaces", () => {
       await screen.findByRole("button", { name: "Edit workspace Remote project" }),
     );
 
-    const specCheckbox = await screen.findByRole("checkbox", {
+    const specCheckbox = await screen.findByRole("switch", {
       name: "Enable Project Spec",
     });
     await waitFor(() => expect(specCheckbox).toBeEnabled());
@@ -1528,7 +1609,7 @@ describe("app-workspaces verification surfaces", () => {
     await userEvent.click(
       await screen.findByRole("button", { name: "Edit workspace Remote project" }),
     );
-    const reopenedSpecCheckbox = await screen.findByRole("checkbox", {
+    const reopenedSpecCheckbox = await screen.findByRole("switch", {
       name: "Enable Project Spec",
     });
     await waitFor(() => expect(reopenedSpecCheckbox).toBeEnabled());
@@ -1554,7 +1635,7 @@ describe("app-workspaces verification surfaces", () => {
       await screen.findByRole("button", { name: "Edit workspace Remote project" }),
     );
 
-    const specCheckbox = await screen.findByRole("checkbox", {
+    const specCheckbox = await screen.findByRole("switch", {
       name: "Enable Project Spec",
     });
     await waitFor(() => expect(specCheckbox).toBeEnabled());
@@ -1568,13 +1649,85 @@ describe("app-workspaces verification surfaces", () => {
       await within(workspaceForm).findByRole("alert"),
     ).toHaveTextContent("Remote Project Spec settings could not be saved");
     expect(
-      within(workspaceForm).getByRole("checkbox", { name: "Enable Project Spec" }),
+      within(workspaceForm).getByRole("switch", { name: "Enable Project Spec" }),
     ).toBeChecked();
     await waitFor(() =>
       expect(
         within(workspaceForm).getByRole("button", { name: "Save workspace" }),
       ).toBeEnabled(),
     );
+  });
+
+  it("backfills Codegraph enablement from the server summary and disables it on save", async () => {
+    const fetchMock = vi.mocked(fetch);
+    appTestState.settingsResponse = {
+      ...settings,
+      workspaces: [
+        { ...configuredWorkspace(workspace, true), codeGraphEnabled: true },
+      ],
+    };
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit workspace Default" }),
+    );
+
+    const codeGraphCheckbox = await screen.findByRole("switch", {
+      name: "Enable Codegraph",
+    });
+    expect(codeGraphCheckbox).toBeChecked();
+    expect(screen.getByText("Indexes code symbols and powers code graph tools in chats. When disabled, no index is built or maintained and chat does not receive code graph tools.")).toBeInTheDocument();
+
+    await userEvent.click(codeGraphCheckbox);
+    expect(codeGraphCheckbox).not.toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Save workspace" }));
+
+    await waitFor(() => {
+      const manualSaveCall = fetchMock.mock.calls.find(
+        ([url, init]) => url === "/api/workspaces/manual" && init?.method === "POST",
+      );
+      expect(manualSaveCall).toBeDefined();
+      expect(JSON.parse(String(manualSaveCall?.[1]?.body))).toEqual(
+        expect.objectContaining({
+          codeGraphEnabled: false,
+          id: "workspace-1",
+        }),
+      );
+    });
+  });
+
+  it("enables Codegraph from workspace settings when the summary reports it disabled", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    await userEvent.click(await screen.findByRole("button", { name: "Workspaces" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit workspace Default" }),
+    );
+
+    const codeGraphCheckbox = await screen.findByRole("switch", {
+      name: "Enable Codegraph",
+    });
+    expect(codeGraphCheckbox).not.toBeChecked();
+    await userEvent.click(codeGraphCheckbox);
+    expect(codeGraphCheckbox).toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Save workspace" }));
+
+    await waitFor(() => {
+      const manualSaveCall = fetchMock.mock.calls.find(
+        ([url, init]) => url === "/api/workspaces/manual" && init?.method === "POST",
+      );
+      expect(manualSaveCall).toBeDefined();
+      expect(JSON.parse(String(manualSaveCall?.[1]?.body))).toEqual(
+        expect.objectContaining({
+          codeGraphEnabled: true,
+          id: "workspace-1",
+        }),
+      );
+    });
   });
 
   it("renders local workspaces without waiting for remote chat hydration", async () => {

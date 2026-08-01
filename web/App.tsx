@@ -1821,6 +1821,8 @@ export function App() {
   const [workspacePath, setWorkspacePath] = useState("");
   const [workspaceTerminalShell, setWorkspaceTerminalShell] = useState("");
   const [workspaceSpecEnabled, setWorkspaceSpecEnabled] = useState(false);
+  const [workspaceCodeGraphEnabled, setWorkspaceCodeGraphEnabled] =
+    useState(false);
   const [workspaceIconDraft, setWorkspaceIconDraft] =
     useState<WorkspaceIconDraft | null>(null);
   const [filePickerRequest, setFilePickerRequest] =
@@ -5936,6 +5938,7 @@ export function App() {
             remotePath: isRemoteWorkspace ? workspacePath : null,
             serverId: isRemoteWorkspace ? workspaceServerId : null,
             terminalShell: workspaceTerminalShell || null,
+            codeGraphEnabled: workspaceCodeGraphEnabled,
             contentBase64: workspaceIconDraft?.contentBase64 ?? null,
           }),
           headers: { "Content-Type": "application/json" },
@@ -5980,6 +5983,7 @@ export function App() {
       setWorkspaceMode("local");
       setWorkspaceTestStages([]);
       setWorkspaceSpecEnabled(false);
+      setWorkspaceCodeGraphEnabled(false);
       closeWorkspaceDialog();
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -14312,6 +14316,7 @@ export function App() {
     setWorkspacePath("");
     setWorkspaceIconDraft(null);
     setWorkspaceSpecEnabled(false);
+    setWorkspaceCodeGraphEnabled(false);
     setWorkspaceTerminalShell("");
     setWorkspaceMode("local");
     setWorkspaceServerId(settings?.remoteServers[0]?.id ?? "");
@@ -16096,6 +16101,7 @@ export function App() {
         )}
         {isWorkspaceDialogOpen ? (
           <WorkspaceDialog
+            codeGraphEnabled={workspaceCodeGraphEnabled}
             iconDraft={workspaceIconDraft}
             inlineServerHost={inlineRemoteServerHost}
             inlineServerName={inlineRemoteServerName}
@@ -16106,6 +16112,7 @@ export function App() {
             name={workspaceName}
             onClearIcon={clearWorkspaceIconDraft}
             onClose={closeWorkspaceDialog}
+            onCodeGraphEnabledChange={setWorkspaceCodeGraphEnabled}
             onCreateInlineServer={() => void createInlineRemoteServer()}
             onInlineServerHostChange={setInlineRemoteServerHost}
             onInlineServerNameChange={setInlineRemoteServerName}

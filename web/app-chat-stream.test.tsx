@@ -108,6 +108,7 @@ function configureRemoteChat() {
     ...secondaryWorkspace,
     chatPagination: { hasMore: false, limit: 5, nextCursor: null, total: 1 },
     chats: [remoteChat],
+    codeGraphEnabled: false,
     connectionStatus: "ready",
     displayPath: "dev-box:/home/fonla/repos/remote-project",
     id: remoteWorkspaceId,
@@ -127,6 +128,7 @@ function configureRemoteChat() {
     workspaces: [
       ...appTestState.settingsResponse.workspaces,
       {
+        codeGraphEnabled: remoteWorkspace.codeGraphEnabled,
         commonCommands: remoteWorkspace.commonCommands,
         connectionStatus: remoteWorkspace.connectionStatus,
         displayPath: remoteWorkspace.displayPath,

@@ -1,5 +1,6 @@
 import {
   CheckCircle2,
+  Code2,
   FolderPlus,
   FolderSearch,
   ScrollText,
@@ -30,6 +31,7 @@ import {
 import { WorkspaceIcon } from "./WorkspaceIcon";
 
 export function WorkspaceDialog({
+  codeGraphEnabled,
   iconDraft,
   inlineServerHost,
   inlineServerName,
@@ -40,6 +42,7 @@ export function WorkspaceDialog({
   name,
   onClearIcon,
   onClose,
+  onCodeGraphEnabledChange,
   onCreateInlineServer,
   onInlineServerHostChange,
   onInlineServerNameChange,
@@ -60,6 +63,7 @@ export function WorkspaceDialog({
   terminalShell,
   testStages,
 }: {
+  codeGraphEnabled: boolean;
   iconDraft: WorkspaceIconDraft | null;
   inlineServerHost: string;
   inlineServerName: string;
@@ -70,6 +74,7 @@ export function WorkspaceDialog({
   name: string;
   onClearIcon: () => void;
   onClose: () => void;
+  onCodeGraphEnabledChange: (enabled: boolean) => void;
   onCreateInlineServer: () => void;
   onInlineServerHostChange: (value: string) => void;
   onInlineServerNameChange: (value: string) => void;
@@ -362,6 +367,44 @@ export function WorkspaceDialog({
                     </Switch.Control>
                   </Switch.Content>
                 </Switch>
+              </div>
+
+              <div className="rounded-lg border border-border bg-surface px-3 py-2">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-foreground">
+                    <Code2
+                      aria-hidden="true"
+                      className="size-4 shrink-0 text-accent"
+                    />
+                    <span
+                      className="truncate"
+                      id="workspace-dialog-code-graph-label"
+                    >
+                      {t("Enable Codegraph")}
+                    </span>
+                  </span>
+                  <Switch
+                    aria-labelledby="workspace-dialog-code-graph-label"
+                    aria-describedby="workspace-dialog-code-graph-description"
+                    isDisabled={isSaving}
+                    isSelected={codeGraphEnabled}
+                    onChange={onCodeGraphEnabledChange}
+                  >
+                    <Switch.Content>
+                      <Switch.Control>
+                        <Switch.Thumb />
+                      </Switch.Control>
+                    </Switch.Content>
+                  </Switch>
+                </div>
+                <p
+                  className="mt-1 text-xs text-muted"
+                  id="workspace-dialog-code-graph-description"
+                >
+                  {t(
+                    "Indexes code symbols and powers code graph tools in chats. When disabled, no index is built or maintained and chat does not receive code graph tools.",
+                  )}
+                </p>
               </div>
 
               <details className="rounded-lg border border-border bg-surface p-3">

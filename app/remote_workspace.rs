@@ -15718,6 +15718,7 @@ async fn remote_sidecar_hook_environment(
         .map_err(|_| "remote sidecar runtime config lock is poisoned".to_string())?
         .clone();
     let mut global_config = foco_store::config::GlobalConfig::first_run(workspace_path.clone());
+    let mut code_graph_enabled = false;
     let (global_hooks, retry_count) = if let Some(bundle) = bundle {
         global_config.agent_definitions = bundle.payload.agent_definitions.clone();
         global_config.prompts = bundle.payload.prompts.clone();
@@ -15727,6 +15728,7 @@ async fn remote_sidecar_hook_environment(
         global_config.memory = bundle.payload.memory.clone();
         global_config.spec = bundle.payload.spec.clone();
         global_config.plan = bundle.payload.plan.clone();
+        code_graph_enabled = bundle.payload.code_graph_enabled;
         (
             bundle.payload.hooks,
             bundle.payload.app.llm_request_retry_count,
@@ -15737,6 +15739,14 @@ async fn remote_sidecar_hook_environment(
             foco_store::config::DEFAULT_LLM_REQUEST_RETRY_COUNT,
         )
     };
+    // Align the first_run default workspace with the actual sidecar workspace
+    // identity and Code Graph capability toggle so the shared execution gate
+    // sees the same workspace config as the host (same contract as
+    // remote_sidecar_runtime_global_config).
+    if let Some(workspace) = global_config.workspaces.first_mut() {
+        workspace.id = state.workspace_id.clone();
+        workspace.code_graph_enabled = code_graph_enabled;
+    }
     let mcp_registry = match workspace_mcp_registry {
         Some(registry) => registry,
         None => remote_sidecar_workspace_mcp_registry(state).await?,
@@ -43609,6 +43619,34 @@ mod tests {
         (state, catalog)
     }
 
+    async fn test_remote_sidecar_local_catalog_enabled_code_graph(
+        workspace_path: &Path,
+        session_mode: Option<&str>,
+    ) -> (RemoteSidecarState, Arc<RemoteToolCatalog>) {
+        let (state, _) = test_sidecar_state(workspace_path.to_string_lossy().to_string(), 0);
+        let mut config = foco_store::config::GlobalConfig::first_run(workspace_path.to_path_buf());
+        config.workspaces[0].code_graph_enabled = true;
+        let bundle = build_sidecar_runtime_config_bundle_for_workspace(
+            workspace_path,
+            &config,
+            &config.workspaces[0].id,
+            1,
+        )
+        .expect("enabled code graph bundle");
+        *state.runtime_config.lock().expect("runtime config lock") = Some(bundle.clone());
+        let catalog = build_remote_tool_catalog(
+            Some(&bundle),
+            session_mode,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+            None,
+        )
+        .await;
+        (state, catalog)
+    }
+
     async fn test_execute_remote_sidecar_local_tool(
         state: &RemoteSidecarState,
         catalog: &RemoteToolCatalog,
@@ -44273,7 +44311,8 @@ mod tests {
         )
         .expect("worktree source");
 
-        let (state, catalog) = test_remote_sidecar_local_catalog(&workspace_path, None).await;
+        let (state, catalog) =
+            test_remote_sidecar_local_catalog_enabled_code_graph(&workspace_path, None).await;
         assert_eq!(
             state
                 .code_graph_indexes

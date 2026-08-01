@@ -888,6 +888,7 @@ describe("app-settings verification surfaces", () => {
       workspaces: [
         settings.workspaces[0],
         {
+          codeGraphEnabled: secondaryWorkspace.codeGraphEnabled,
           commonCommands: secondaryWorkspace.commonCommands,
           id: secondaryWorkspace.id,
           isDefault: false,
@@ -944,6 +945,46 @@ describe("app-settings verification surfaces", () => {
         selector: "p",
       }),
     ).toBeInTheDocument();
+  });
+
+  it("toggles Codegraph enablement for a workspace from the settings edit form", async () => {
+    const fetchMock = vi.mocked(fetch);
+    appTestState.settingsResponse = {
+      ...settings,
+      workspaces: [
+        { ...appTestState.settingsResponse.workspaces[0]!, codeGraphEnabled: true },
+      ],
+    };
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Workspaces" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit workspace Default" }),
+    );
+
+    const codeGraphCheckbox = await screen.findByRole("switch", {
+      name: "Enable Codegraph",
+    });
+    await waitFor(() => expect(codeGraphCheckbox).toBeEnabled());
+    expect(codeGraphCheckbox).toBeChecked();
+    await userEvent.click(codeGraphCheckbox);
+    expect(codeGraphCheckbox).not.toBeChecked();
+    await userEvent.click(screen.getByRole("button", { name: "Save workspace" }));
+
+    await waitFor(() => {
+      const manualSaveCall = fetchMock.mock.calls.find(
+        ([url, init]) => url === "/api/workspaces/manual" && init?.method === "POST",
+      );
+      expect(manualSaveCall).toBeDefined();
+      expect(JSON.parse(String(manualSaveCall?.[1]?.body))).toEqual(
+        expect.objectContaining({
+          codeGraphEnabled: false,
+          id: "workspace-1",
+        }),
+      );
+    });
   });
 
   it("shows Spec job history and retries failed jobs", async () => {
@@ -3744,6 +3785,7 @@ describe("app-settings verification surfaces", () => {
       workspaces: [
         settings.workspaces[0],
         {
+          codeGraphEnabled: secondaryWorkspace.codeGraphEnabled,
           commonCommands: secondaryWorkspace.commonCommands,
           connectionStatus: secondaryWorkspace.connectionStatus,
           displayPath: secondaryWorkspace.displayPath,
