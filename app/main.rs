@@ -14246,13 +14246,25 @@ fn finalized_assistant_message_parts(
         );
     }
     let completed_final_text_segment = completed_final_text_segment(events, assistant_message_id)?;
-    if let Some(CompletedFinalTextSegment {
-        has_final_text_segment: true,
-        text: Some(text),
-    }) = completed_final_text_segment.as_ref()
-    {
-        replace_last_text_part(&mut parts, text);
-    } else if completed_final_text_segment.is_none()
+    let has_missing_tool_call_parts = tool_calls
+        .iter()
+        .any(|tool_call| !seen_tool_call_ids.contains(&tool_call.id));
+    let final_text_to_append = match completed_final_text_segment.as_ref() {
+        Some(CompletedFinalTextSegment {
+            has_final_text_segment: true,
+            text: Some(text),
+        }) if !has_missing_tool_call_parts
+            && replace_trailing_final_text_part(&mut parts, text, tool_calls) =>
+        {
+            None
+        }
+        Some(CompletedFinalTextSegment {
+            has_final_text_segment: true,
+            text: Some(text),
+        }) => Some(text.as_str()),
+        _ => None,
+    };
+    if completed_final_text_segment.is_none()
         && !assistant_text.is_empty()
         && !parts
             .iter()
@@ -14270,7 +14282,12 @@ fn finalized_assistant_message_parts(
             &tool_call.id,
         );
     }
-    if let Some(CompletedFinalTextSegment {
+    if let Some(text) = final_text_to_append {
+        // Some older or interrupted streams can lack a tool_call audit event.
+        // The durable completion is nevertheless after every executed tool, so
+        // append it only after recovering those missing cards.
+        push_text_part(&mut parts, text);
+    } else if let Some(CompletedFinalTextSegment {
         has_final_text_segment: false,
         text: Some(text),
     }) = completed_final_text_segment.as_ref()
@@ -14410,19 +14427,29 @@ fn push_text_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
     }
 }
 
-fn replace_last_text_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
+fn replace_trailing_final_text_part(
+    parts: &mut [ChatMessagePart],
+    text: &str,
+    tool_calls: &[ChatToolCallSummary],
+) -> bool {
     if text.is_empty() {
-        return;
+        return false;
     }
-    if let Some(ChatMessagePart::Text { text: existing }) = parts
-        .iter_mut()
-        .rev()
-        .find(|part| matches!(part, ChatMessagePart::Text { .. }))
+    let Some(last_part_index) = parts.len().checked_sub(1) else {
+        return false;
+    };
+    if !tool_calls.is_empty()
+        && !parts[..last_part_index]
+            .iter()
+            .any(|part| matches!(part, ChatMessagePart::ToolCall { .. }))
     {
-        *existing = text.to_string();
-    } else {
-        push_text_part(parts, text);
+        return false;
     }
+    let Some(ChatMessagePart::Text { text: existing }) = parts.get_mut(last_part_index) else {
+        return false;
+    };
+    *existing = text.to_string();
+    true
 }
 
 fn timestamp_duration_ms(started_at: &str, ended_at: &str) -> Option<i64> {

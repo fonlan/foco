@@ -10790,6 +10790,78 @@ fn finalized_assistant_parts_replace_only_the_durable_final_text_segment() {
 }
 
 #[test]
+fn finalized_assistant_parts_append_final_text_after_a_tool_missing_from_events() {
+    let first_tool_call = ChatToolCallSummary {
+        id: "tool-1".to_string(),
+        name: "read_file".to_string(),
+        status: "completed".to_string(),
+        input: json!({ "path": "README.md" }),
+        output: None,
+        is_error: false,
+        started_at: None,
+        completed_at: None,
+        live_output: None,
+    };
+    let missing_tool_call = ChatToolCallSummary {
+        id: "tool-2".to_string(),
+        name: "search_text".to_string(),
+        status: "completed".to_string(),
+        input: json!({ "query": "TODO" }),
+        output: None,
+        is_error: false,
+        started_at: None,
+        completed_at: None,
+        live_output: None,
+    };
+    let events = [
+        (
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Before tools. " }),
+        ),
+        (
+            "tool_call",
+            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-1" } }),
+        ),
+        (
+            "completion",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "hasFinalTextSegment": true,
+                "finalTextSegment": "Final conclusion.",
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(event_type, value)| CapturedAuditEvent {
+        event_at: "2026-08-01T02:00:00Z".to_string(),
+        event_type: event_type.to_string(),
+        normalized_event_json: value.to_string(),
+    })
+    .collect::<Vec<_>>();
+
+    let parts = finalized_assistant_message_parts(
+        "assistant-1",
+        &events,
+        "Before tools. Final conclusion.",
+        None,
+        &[first_tool_call, missing_tool_call],
+        None,
+    )
+    .expect("stored parts");
+
+    assert!(matches!(&parts[0], StoredChatMessagePart::Text { text } if text == "Before tools. "));
+    assert!(
+        matches!(&parts[1], StoredChatMessagePart::ToolCall { tool_call_id } if tool_call_id == "tool-1")
+    );
+    assert!(
+        matches!(&parts[2], StoredChatMessagePart::ToolCall { tool_call_id } if tool_call_id == "tool-2")
+    );
+    assert!(
+        matches!(&parts[3], StoredChatMessagePart::Text { text } if text == "Final conclusion.")
+    );
+}
+
+#[test]
 fn finalized_assistant_parts_append_tool_only_completion_after_tools() {
     let tool_call = ChatToolCallSummary {
         id: "tool-1".to_string(),
