@@ -7767,6 +7767,13 @@ async fn broker_llm_stream(
     let temperature = (request_kind == BROKER_DEFAULT_LLM_REQUEST_KIND)
         .then(|| crate::plan_mode_temperature(payload.get("sessionMode").and_then(Value::as_str)))
         .flatten();
+    // Auxiliary structured requests (sidecar memory retrieval / spec / etc.) opt into
+    // DeepSeek thinking disable through an explicit payload flag. The broker still resolves
+    // the real-time upstream model before deciding whether `thinking.disabled` is sent.
+    let disable_thinking = payload
+        .get("disableThinking")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let mut request = payload
         .get("request")
@@ -7956,6 +7963,7 @@ async fn broker_llm_stream(
                         latency_mode,
                         developer_role_enabled: model.developer_role_enabled,
                         temperature,
+                        disable_thinking,
                     },
                     save_details,
                     audit_writer.observer(),
@@ -7984,6 +7992,7 @@ async fn broker_llm_stream(
                     latency_mode,
                     developer_role_enabled: model.developer_role_enabled,
                     temperature,
+                    disable_thinking,
                 },
                 save_details,
                 audit_writer.observer(),
@@ -24567,6 +24576,10 @@ async fn remote_sidecar_broker_tool_request_once(
         "requestKind": request_kind,
         "timeoutMs": timeout_ms,
         "request": request,
+        // Structured single-tool auxiliary requests (git commit message, workspace spec
+        // generation/update) opt into DeepSeek thinking disable; the broker still resolves the
+        // real-time upstream model before deciding whether `thinking.disabled` is sent.
+        "disableThinking": true,
     });
     let mut broker_rx = timeout(
         crate::remaining_llm_request_timeout(request_started_at, timeout_ms),
@@ -33647,6 +33660,293 @@ mod tests {
                 .as_ref()
                 .expect("detail response body")["http"]["headers"]["x-broker-multi"],
             json!(["first", "second"])
+        );
+    }
+
+    /// Run one broker `llm.stream` auxiliary request against a request-capturing provider
+    /// fixture and return the broker response plus the provider request body as JSON.
+    async fn run_broker_control_llm_stream_thinking_fixture(
+        broker_request_id: &str,
+        provider_kind: &str,
+        model_redirects: Vec<foco_providers::ProviderModelRedirect>,
+        disable_thinking_payload: Option<bool>,
+        request_thinking_level: Option<String>,
+    ) -> (ControlEnvelope, Value) {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let provider_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider_app = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let provider_requests = provider_requests.clone();
+                move |body: axum::body::Bytes| {
+                    let provider_requests = provider_requests.clone();
+                    async move {
+                        provider_requests
+                            .lock()
+                            .expect("provider request capture")
+                            .push(body.to_vec());
+                        let mut response = axum::response::Response::new(axum::body::Body::from(
+                            concat!(
+                                "data: {\"id\":\"broker-thinking-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                                "data: {\"id\":\"broker-thinking-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+                                "data: [DONE]\n\n"
+                            ),
+                        ));
+                        response.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            header::HeaderValue::from_static("text/event-stream"),
+                        );
+                        response
+                    }
+                }
+            }),
+        );
+        let provider_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider fixture");
+        let provider_address = provider_listener
+            .local_addr()
+            .expect("provider fixture address");
+        let provider_task = tokio::spawn(async move {
+            axum::serve(provider_listener, provider_app)
+                .await
+                .expect("serve provider fixture");
+        });
+
+        let mut config = remote_test_config(workspace.path());
+        config.app.api_audit.save_request_response_details = true;
+        config.workspaces[0].path = PathBuf::new();
+        config.workspaces[0].location = WorkspaceLocation::Ssh {
+            server_id: "server-1".to_string(),
+            remote_path: "/remote/project".to_string(),
+        };
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "provider-1".to_string(),
+            name: "Provider 1".to_string(),
+            kind: provider_kind.to_string(),
+            enabled: true,
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("remote-provider-test-key".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects,
+            api_proxy: foco_store::config::ApiProxySettings::default(),
+        });
+        let workspace_id = config.workspaces[0].id.clone();
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        let provider_request = NeutralChatRequest {
+            model_id: "model-1".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "Produce the structured auxiliary output.".to_string(),
+            )],
+            tools: Vec::new(),
+            thinking_level: request_thinking_level,
+            max_output_tokens: Some(256),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
+        };
+        let mut broker_payload = json!({
+            "workspaceId": workspace_id,
+            "chatId": "chat-thinking-disable",
+            "requestId": broker_request_id,
+            "providerId": "provider-1",
+            "modelId": "model-1",
+            "requestKind": LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
+            "request": provider_request,
+        });
+        if let Some(flag) = disable_thinking_payload {
+            broker_payload["disableThinking"] = Value::Bool(flag);
+        }
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind control fixture");
+        let control_address = control_listener
+            .local_addr()
+            .expect("control fixture address");
+        let control_request_id = broker_request_id.to_string();
+        let control_task = tokio::spawn(async move {
+            let (stream, _) = control_listener
+                .accept()
+                .await
+                .expect("accept control connection");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept control websocket");
+            let config_message = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("config sync timeout")
+                .expect("config sync message")
+                .expect("config sync websocket result");
+            let tungstenite::Message::Text(config_text) = config_message else {
+                panic!("expected config sync text frame");
+            };
+            let config_envelope: ControlEnvelope =
+                serde_json::from_str(config_text.as_str()).expect("config sync envelope");
+            assert_eq!(config_envelope.message_type, "config");
+            let config_id = config_envelope.id.expect("config sync id");
+            let config_response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(config_id),
+                method: None,
+                payload: json!({ "status": "ok" }),
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&config_response)
+                        .expect("serialize config response")
+                        .into(),
+                ))
+                .await
+                .expect("send config response");
+            let request = ControlEnvelope {
+                version: 1,
+                message_type: "request".to_string(),
+                id: Some(control_request_id.clone()),
+                method: Some("llm.stream".to_string()),
+                payload: broker_payload,
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&request)
+                        .expect("serialize broker request")
+                        .into(),
+                ))
+                .await
+                .expect("send broker request");
+
+            loop {
+                let message = timeout(Duration::from_secs(8), socket.next())
+                    .await
+                    .expect("broker response timeout")
+                    .expect("broker response message")
+                    .expect("broker response websocket result");
+                let tungstenite::Message::Text(text) = message else {
+                    continue;
+                };
+                let envelope: ControlEnvelope =
+                    serde_json::from_str(text.as_str()).expect("broker response envelope");
+                if envelope.id.as_deref() != Some(control_request_id.as_str()) {
+                    continue;
+                }
+                match envelope.message_type.as_str() {
+                    "response" => return envelope,
+                    "error" => panic!("brokered LLM request failed: {}", envelope.payload),
+                    _ => {}
+                }
+            }
+        });
+        let connection_task = connect_control_ws(
+            state.clone(),
+            control_address.port(),
+            "control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(RemoteSessionStatus::new(
+                RemoteConnectionState::Disconnected,
+                None,
+            ))),
+            None,
+            RemoteWorkspaceManager::default(),
+        )
+        .await
+        .expect("connect main-process control websocket");
+        let broker_response = timeout(Duration::from_secs(10), control_task)
+            .await
+            .expect("control fixture completion timeout")
+            .expect("control fixture task");
+        connection_task.abort();
+        let _ = connection_task.await;
+        provider_task.abort();
+        let _ = provider_task.await;
+
+        assert_eq!(broker_response.payload["status"], "ok");
+        let provider_body = provider_requests
+            .lock()
+            .expect("provider requests")
+            .pop()
+            .expect("provider request body");
+        let body_json: Value =
+            serde_json::from_slice(&provider_body).expect("provider request JSON");
+        (broker_response, body_json)
+    }
+
+    #[tokio::test]
+    async fn broker_llm_stream_sends_thinking_disabled_for_deepseek_auxiliary_request() {
+        let (_broker_response, body_json) = run_broker_control_llm_stream_thinking_fixture(
+            "broker-request-thinking-disabled",
+            foco_providers::OPENCODE_GO_KIND,
+            vec![foco_providers::ProviderModelRedirect {
+                from: "deepseek-chat".to_string(),
+                to: "model-1".to_string(),
+            }],
+            Some(true),
+            Some("high".to_string()),
+        )
+        .await;
+        assert_eq!(
+            body_json["thinking"],
+            json!({ "type": "disabled" }),
+            "broker must send thinking.disabled for DeepSeek auxiliary requests"
+        );
+        assert!(
+            body_json.get("reasoning_effort").is_none(),
+            "DeepSeek thinking-disabled requests must not send reasoning_effort"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_llm_stream_without_disable_thinking_keeps_deepseek_wire_unchanged() {
+        let (_broker_response, body_json) = run_broker_control_llm_stream_thinking_fixture(
+            "broker-request-thinking-default",
+            foco_providers::OPENCODE_GO_KIND,
+            vec![foco_providers::ProviderModelRedirect {
+                from: "deepseek-chat".to_string(),
+                to: "model-1".to_string(),
+            }],
+            None,
+            Some("high".to_string()),
+        )
+        .await;
+        assert!(
+            body_json.get("thinking").is_none(),
+            "broker must not inject thinking.disabled without the explicit opt-in flag"
+        );
+        assert_eq!(
+            body_json["reasoning_effort"], "high",
+            "normal DeepSeek requests keep the existing reasoning_effort semantics"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_llm_stream_disable_thinking_does_not_affect_non_deepseek_auxiliary_request() {
+        let (_broker_response, body_json) = run_broker_control_llm_stream_thinking_fixture(
+            "broker-request-thinking-non-deepseek",
+            foco_providers::OPENAI_CHAT_KIND,
+            Vec::new(),
+            Some(true),
+            Some("high".to_string()),
+        )
+        .await;
+        assert!(
+            body_json.get("thinking").is_none(),
+            "non-DeepSeek upstream models must never receive the DeepSeek thinking opt-out"
+        );
+        assert_eq!(
+            body_json["reasoning_effort"], "high",
+            "non-DeepSeek requests keep the existing reasoning_effort semantics"
         );
     }
 

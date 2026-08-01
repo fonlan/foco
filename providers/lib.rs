@@ -1144,6 +1144,14 @@ pub struct ChatRequestRuntimeOptions {
     /// Optional per-request sampling override for user-visible chat runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
+    /// Whether the provider wire should disable model thinking when the upstream model
+    /// supports it (DeepSeek top-level `{"thinking":{"type":"disabled"}}`).
+    ///
+    /// Internal auxiliary requests (chat title generation, memory retrieval) opt in to avoid
+    /// spending the reasoning budget on short structured outputs; normal chat keeps the
+    /// existing thinking semantics. Non-DeepSeek upstream models are never affected.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disable_thinking: bool,
 }
 
 impl Default for ChatRequestRuntimeOptions {
@@ -1152,6 +1160,7 @@ impl Default for ChatRequestRuntimeOptions {
             latency_mode: LatencyMode::Standard,
             developer_role_enabled: true,
             temperature: None,
+            disable_thinking: false,
         }
     }
 }
@@ -1162,6 +1171,10 @@ fn default_developer_role_enabled() -> bool {
 
 fn is_true(value: &bool) -> bool {
     *value
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Return whether this provider route can expose the Fast latency mode for `model_id`.
@@ -1507,6 +1520,16 @@ pub fn adapter_supports_required_single_tool(adapter_kind: AdapterKind) -> bool 
 /// gateway (OpenCode Go, OpenRouter, OpenAI-compatible proxies). Match whole path/name
 /// tokens so `deepseek-chat`, `deepseek/deepseek-v3`, and `provider/deepseek-r1` all hit.
 pub fn model_rejects_native_tool_choice(model_id: &str) -> bool {
+    is_deepseek_upstream_model(model_id)
+}
+
+/// Whether the upstream model id belongs to the DeepSeek family.
+///
+/// DeepSeek rejects native forced `tool_choice` and supports a top-level
+/// `{"thinking":{"type":"disabled"}}` opt-out. The same whole path/name token match is
+/// used for both, so `deepseek-chat`, `deepseek/deepseek-v3`, and
+/// `provider/deepseek-r1` all hit whether reached directly or through a gateway.
+pub fn is_deepseek_upstream_model(model_id: &str) -> bool {
     model_id
         .trim()
         .to_ascii_lowercase()
@@ -2892,12 +2915,16 @@ fn genai_chat_options_with_runtime_options(
     }
 
     if let Some(thinking_level) = request.thinking_level.as_deref() {
-        let effort = thinking_level.parse::<ReasoningEffort>().map_err(|_| {
-            ProviderConfigError::InvalidRequest(format!(
-                "unsupported thinking level '{thinking_level}'"
-            ))
-        })?;
-        options = options.with_reasoning_effort(effort);
+        // Thinking-disabled DeepSeek auxiliary requests must not also send
+        // `reasoning_effort`: the model would reject the contradictory combination.
+        if !(runtime_options.disable_thinking && is_deepseek_upstream_model(&model_id)) {
+            let effort = thinking_level.parse::<ReasoningEffort>().map_err(|_| {
+                ProviderConfigError::InvalidRequest(format!(
+                    "unsupported thinking level '{thinking_level}'"
+                ))
+            })?;
+            options = options.with_reasoning_effort(effort);
+        }
     }
 
     if let Some(prompt_cache_key) = request.prompt_cache_key.as_deref() {
@@ -2999,6 +3026,10 @@ fn apply_request_overrides_and_agent_headers(
     // persisted UI mode always describes the service tier sent to OpenAI Responses.
     apply_fast_latency_mode(&mut body, config, request, runtime_options)?;
 
+    // DeepSeek thinking disable is a first-class auxiliary-request choice. It must win over
+    // generic body overrides so the request actually sends `thinking.disabled`.
+    apply_disable_thinking_mode(&mut body, config, request, runtime_options)?;
+
     // OpenAI Responses only (not xAI Responses): built-in Agent headers first, then overrides.
     let headers = if uses_openai_resp_agent_headers(config.kind) {
         merge_header_pairs(
@@ -3044,6 +3075,31 @@ fn apply_fast_latency_mode(
     body.insert(
         "service_tier".to_string(),
         Value::String("priority".to_string()),
+    );
+    Ok(())
+}
+
+fn apply_disable_thinking_mode(
+    body: &mut Map<String, Value>,
+    config: &ProviderConnectionConfig,
+    request: &NeutralChatRequest,
+    runtime_options: &ChatRequestRuntimeOptions,
+) -> Result<(), ProviderConfigError> {
+    if !runtime_options.disable_thinking {
+        return Ok(());
+    }
+    // Resolve the redirected upstream model so aliases pointing at DeepSeek (direct or via
+    // OpenCode Go / OpenRouter) send the same opt-out as native DeepSeek.
+    let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)?;
+    if !is_deepseek_upstream_model(upstream_model_id) {
+        return Ok(());
+    }
+    body.insert(
+        "thinking".to_string(),
+        Value::Object(Map::from_iter([(
+            "type".to_string(),
+            Value::String("disabled".to_string()),
+        )])),
     );
     Ok(())
 }
@@ -5131,6 +5187,7 @@ mod tests {
             latency_mode: LatencyMode::Fast,
             developer_role_enabled: true,
             temperature: None,
+            disable_thinking: false,
         })
         .expect("serialize runtime options");
 
@@ -5170,6 +5227,7 @@ mod tests {
                 latency_mode: LatencyMode::Fast,
                 developer_role_enabled: true,
                 temperature: None,
+                disable_thinking: false,
             },
         )
         .expect("Fast should take precedence over service tier override");
@@ -5199,6 +5257,7 @@ mod tests {
                 latency_mode: LatencyMode::Fast,
                 developer_role_enabled: true,
                 temperature: None,
+                disable_thinking: false,
             },
         )
         .expect_err("non-Responses adapters must reject Fast");
@@ -5513,6 +5572,7 @@ mod tests {
                 latency_mode: LatencyMode::Fast,
                 developer_role_enabled: true,
                 temperature: None,
+                disable_thinking: false,
             },
         )
         .expect("Fast options");
@@ -5555,6 +5615,7 @@ mod tests {
                 latency_mode: LatencyMode::Fast,
                 developer_role_enabled: true,
                 temperature: None,
+                disable_thinking: false,
             },
             true,
         )
@@ -7709,6 +7770,7 @@ mod tests {
                 latency_mode: LatencyMode::Standard,
                 developer_role_enabled: true,
                 temperature: Some(0.7),
+                disable_thinking: false,
             },
         )
         .expect("runtime temperature override should be accepted");
@@ -8423,6 +8485,174 @@ mod tests {
         assert_eq!(
             body_json["tools"][0]["function"]["name"],
             "select_relevant_memory"
+        );
+
+        while stream.next_event().await.is_some() {}
+        let _ = fixture.await;
+    }
+
+    #[tokio::test]
+    async fn disable_thinking_sends_thinking_disabled_on_deepseek_chat_wire() {
+        let response = concat!(
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(DEEPSEEK_KIND).expect("deepseek kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "title this chat",
+        )]);
+        request.model_id = "deepseek-chat".to_string();
+        // A thinking level is supplied on purpose: thinking-disabled DeepSeek requests must
+        // drop the contradictory `reasoning_effort` field instead of sending both.
+        request.thinking_level = Some("high".to_string());
+
+        let mut stream = stream_chat_with_capture_runtime_options(
+            &config,
+            request,
+            ChatRequestRuntimeOptions {
+                disable_thinking: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("open fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .as_http()
+            .expect("http request dump")
+            .clone();
+        let body = dump.body.as_deref().expect("request body");
+        let body_json: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(
+            body_json["thinking"],
+            serde_json::json!({ "type": "disabled" })
+        );
+        assert!(
+            body_json.get("reasoning_effort").is_none(),
+            "DeepSeek thinking-disabled requests must not send reasoning_effort"
+        );
+
+        while stream.next_event().await.is_some() {}
+        let _ = fixture.await;
+    }
+
+    #[tokio::test]
+    async fn disable_thinking_does_not_change_non_deepseek_wire() {
+        let response = concat!(
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "title this chat",
+        )]);
+        request.thinking_level = Some("high".to_string());
+
+        let mut stream = stream_chat_with_capture_runtime_options(
+            &config,
+            request,
+            ChatRequestRuntimeOptions {
+                disable_thinking: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("open fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .as_http()
+            .expect("http request dump")
+            .clone();
+        let body = dump.body.as_deref().expect("request body");
+        let body_json: Value = serde_json::from_str(body).expect("request JSON");
+        assert!(
+            body_json.get("thinking").is_none(),
+            "non-DeepSeek upstream models must never receive the DeepSeek thinking opt-out"
+        );
+        assert_eq!(
+            body_json["reasoning_effort"], "high",
+            "non-DeepSeek requests keep the existing reasoning_effort semantics"
+        );
+
+        while stream.next_event().await.is_some() {}
+        let _ = fixture.await;
+    }
+
+    #[tokio::test]
+    async fn disable_thinking_follows_model_redirect_to_deepseek_on_opencode_go_wire() {
+        let response = concat!(
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENCODE_GO_KIND).expect("opencode-go kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: vec![ProviderModelRedirect {
+                from: "deepseek/deepseek-v3".to_string(),
+                to: "ds-alias".to_string(),
+            }],
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "title this chat",
+        )]);
+        request.model_id = "ds-alias".to_string();
+
+        let mut stream = stream_chat_with_capture_runtime_options(
+            &config,
+            request,
+            ChatRequestRuntimeOptions {
+                disable_thinking: true,
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .expect("open fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .as_http()
+            .expect("http request dump")
+            .clone();
+        let body = dump.body.as_deref().expect("request body");
+        let body_json: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(
+            body_json["thinking"],
+            serde_json::json!({ "type": "disabled" }),
+            "model redirects must resolve the actual upstream model before sending thinking disabled"
         );
 
         while stream.next_event().await.is_some() {}

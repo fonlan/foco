@@ -3846,6 +3846,7 @@ impl PreparedChatContext {
                                     .map(|model| model.developer_role_enabled)
                                     .unwrap_or(true),
                                 temperature: plan_mode_temperature(self.session_mode.as_deref()),
+                                disable_thinking: false,
                             },
                             api_audit_save_details(&self.global_config),
                             turn_capture.observer(),
@@ -6451,6 +6452,7 @@ pub(crate) async fn audited_provider_text_request(
     provider_id: &str,
     provider_config: &ProviderConnectionConfig,
     developer_role_enabled: bool,
+    disable_thinking: bool,
     request: NeutralChatRequest,
     request_kind: &str,
     timeout_ms: u64,
@@ -6532,6 +6534,7 @@ pub(crate) async fn audited_provider_text_request(
         let result = run_provider_stream_for_text(
             provider_config,
             developer_role_enabled,
+            disable_thinking,
             attempt_request,
             request_kind,
             timeout_ms,
@@ -6652,6 +6655,7 @@ pub(crate) async fn audited_provider_tool_request(
         provider_id,
         provider_config,
         developer_role_enabled,
+        false,
         request,
         request_kind,
         expected_tool_name,
@@ -6675,6 +6679,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
     provider_id: &str,
     provider_config: &ProviderConnectionConfig,
     developer_role_enabled: bool,
+    disable_thinking: bool,
     request: NeutralChatRequest,
     request_kind: &str,
     expected_tool_name: &str,
@@ -6797,6 +6802,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
         let result = run_provider_stream_for_tool(
             provider_config,
             developer_role_enabled,
+            disable_thinking,
             attempt_request,
             request_kind,
             expected_tool_name,
@@ -7253,6 +7259,7 @@ impl AuditedProviderError {
 async fn run_provider_stream_for_text(
     provider_config: &ProviderConnectionConfig,
     developer_role_enabled: bool,
+    disable_thinking: bool,
     request: NeutralChatRequest,
     request_kind: &str,
     timeout_ms: u64,
@@ -7268,6 +7275,7 @@ async fn run_provider_stream_for_text(
             request,
             foco_providers::ChatRequestRuntimeOptions {
                 developer_role_enabled,
+                disable_thinking,
                 ..Default::default()
             },
             capture_details,
@@ -7409,6 +7417,7 @@ async fn run_provider_stream_for_text(
 async fn run_provider_stream_for_tool(
     provider_config: &ProviderConnectionConfig,
     developer_role_enabled: bool,
+    disable_thinking: bool,
     request: NeutralChatRequest,
     request_kind: &str,
     expected_tool_name: &str,
@@ -7427,6 +7436,7 @@ async fn run_provider_stream_for_tool(
             request,
             foco_providers::ChatRequestRuntimeOptions {
                 developer_role_enabled,
+                disable_thinking,
                 ..Default::default()
             },
             capture_details,

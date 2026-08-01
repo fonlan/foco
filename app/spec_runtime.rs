@@ -918,6 +918,7 @@ async fn run_workspace_spec_update_job_inner(
         &model.provider_id,
         &model.provider_config,
         crate::developer_role_enabled_for_model(config, &model.model_id),
+        false,
         request,
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
         WORKSPACE_SPEC_UPDATE_TOOL_NAME,

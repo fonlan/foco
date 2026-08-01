@@ -38239,6 +38239,7 @@ async fn run_provider_stream_for_text_returns_readable_timeout() {
     let error = match run_provider_stream_for_text(
         &provider_config,
         true,
+        false,
         request,
         "model availability test",
         1,
